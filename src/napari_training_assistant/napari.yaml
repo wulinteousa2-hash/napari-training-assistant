@@ -3,7 +3,7 @@ display_name: Training Assistant
 contributions:
   commands:
     - id: napari-training-assistant.make_training_widget
-      python_name: napari_training_assistant._widget:TrainingAssistantWidget
+      python_name: napari_training_assistant._workflow_widget:TrainingAssistantWidget
       title: Training Assistant
   widgets:
     - command: napari-training-assistant.make_training_widget

@@ -7,10 +7,11 @@
 - Added persistent dataset manifest with accepted image/mask pairs.
 - Added checkpoint metadata, training run history, benchmark CSV, prediction
   output storage, and latest checkpoint pointer.
-- Added two-column dock widget layout.
-- Added dedicated UI sections for Project, Dataset history, Training settings,
-  U-Net architecture, Starting weights, Model checkpoints, Prediction outputs,
-  and Training actions.
+- Added tabbed dock widget layout with a compact project status bar.
+- Added workflow tabs for Dataset, Train, Checkpoints, Predict, and Advanced.
+- Moved advanced U-Net architecture and imported-weight controls out of the
+  primary training view.
+- Replaced dense dataset/checkpoint lists with compact tables.
 - Added configurable U-Net architecture schema with 2D support and future-ready
   3D dimensionality metadata.
 - Added default `basic_unet` descriptor: depth 4, base channels 32, feature

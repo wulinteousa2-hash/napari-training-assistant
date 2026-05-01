@@ -19,21 +19,29 @@ can be validated before connecting the real trainer.
 
 ## User Interface
 
-The dock widget is organized as a two-column workflow.
+The dock widget is organized as a tabbed workflow with a compact project status
+bar at the top.
 
-Left column:
+Always visible:
 
-- Project
-- Dataset history
-- Model checkpoints
-- Prediction outputs
+- Project selector
+- Short project path
+- Project state
+- Dataset count
+- Latest checkpoint
+- Latest benchmark summary
 
-Right column:
+Tabs:
 
-- Training settings
-- U-Net architecture
-- Starting weights
-- Training actions
+- **Dataset**: choose image/mask layers, prepare masks, add accepted pairs, and
+  inspect the compact dataset table.
+- **Train**: choose training mode, dataset source, starting point, and core
+  training parameters.
+- **Checkpoints**: inspect checkpoint history and choose a checkpoint for
+  continued training.
+- **Predict**: save prediction layers into the project.
+- **Advanced**: edit U-Net architecture, import pretrained weights, and update
+  project notes.
 
 Training-related actions are disabled until the user selects or creates a
 Training Project Folder.
