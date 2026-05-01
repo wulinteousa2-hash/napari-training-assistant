@@ -33,6 +33,9 @@ Always visible:
 
 Tabs:
 
+- **SAM3**: configure SAM3 model folders, choose a prompt mode, auto-create
+  prompt layers, prepare preview labels, and accept preview masks into the
+  persistent dataset.
 - **Dataset**: choose image/mask layers, prepare masks, add accepted pairs, and
   inspect the compact dataset table.
 - **Train**: choose training mode, dataset source, starting point, and core
@@ -59,6 +62,9 @@ training_project/
 
     architecture/
         architecture_config.json
+
+    sam3/
+        sam3_config.json
 
     dataset/
         images/
@@ -91,6 +97,35 @@ training_project/
 Reopening the same project restores dataset history, training settings, U-Net
 architecture settings, starting-weight choice, checkpoint history, latest
 checkpoint pointer, benchmark history, and previously selected layer names.
+
+## SAM3 Annotation Tab
+
+The SAM3 tab is task-driven. The user selects an image layer and a prompt mode;
+the plugin creates or reuses the expected napari prompt layer automatically.
+
+Supported prompt modes in the compact UI:
+
+- **2D box**: creates/selects `SAM3 boxes` as a Shapes layer in rectangle mode.
+- **2D points**: creates/selects `SAM3 points` as a Points layer.
+- **Live points**: creates/selects `SAM3 live points`; intended for immediate
+  point-driven preview once inference is wired.
+- **2D exemplar**: creates/selects `SAM3 exemplar boxes` as a Shapes layer.
+- **3D / multiplex**: creates/selects `SAM3 3D prompts`; intended for SAM3.1
+  multiplex propagation once inference is wired.
+
+Model folder expectations:
+
+- 2D modes use a SAM3.0 image model folder containing `sam3.pt` or
+  `model.safetensors`.
+- 3D / multiplex mode uses a SAM3.1 model folder containing
+  `sam3.1_multiplex.pt`.
+- CPU is only treated as valid for 2D mode. SAM3.1 multiplex requires CUDA.
+
+The current SAM3 tab prepares layers and validates model folders, but real SAM3
+preview inference is not connected yet. Once inference is connected, preview
+results should update `SAM3 preview labels`. The **Accept preview to Dataset**
+button already routes that preview through the same persistent mask-preparation
+path as the Dataset tab.
 
 ## U-Net Architecture
 

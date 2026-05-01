@@ -17,6 +17,7 @@ def test_create_project_writes_required_structure(tmp_path: Path):
     assert project.architecture_config_path.exists()
     assert project.starting_weights_config_path.exists()
     assert project.model_registry_path.exists()
+    assert project.sam3_config_path.exists()
     assert project.validate().status == "valid"
 
 
@@ -126,3 +127,24 @@ def test_basic_unet_descriptor_counts_layers():
     assert description["double_conv_layers"] == 18
     assert description["upsampling_layers"] == 4
     assert description["final_projection_layers"] == 1
+
+
+def test_sam3_config_reload(tmp_path: Path):
+    project = TrainingProject.create_or_open(tmp_path / "training_project")
+    project.save_sam3_config(
+        {
+            "default_mode": "live_points",
+            "sam3_2d_model_dir": "/models/sam3",
+            "sam3_3d_model_dir": "/models/sam3.1",
+            "device": "cuda",
+            "last_image_layer": "nuclei",
+        }
+    )
+
+    reopened = TrainingProject.create_or_open(project.root)
+    config = reopened.load_sam3_config()
+    assert config["default_mode"] == "live_points"
+    assert config["sam3_2d_model_dir"] == "/models/sam3"
+    assert config["sam3_3d_model_dir"] == "/models/sam3.1"
+    assert config["device"] == "cuda"
+    assert config["last_image_layer"] == "nuclei"

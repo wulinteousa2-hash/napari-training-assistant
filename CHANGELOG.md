@@ -8,7 +8,15 @@
 - Added checkpoint metadata, training run history, benchmark CSV, prediction
   output storage, and latest checkpoint pointer.
 - Added tabbed dock widget layout with a compact project status bar.
-- Added workflow tabs for Dataset, Train, Checkpoints, Predict, and Advanced.
+- Added workflow tabs for SAM3, Dataset, Train, Checkpoints, Predict, and
+  Advanced.
+- Added compact SAM3 tab with task-driven prompt layer creation for 2D box, 2D
+  points, live points, 2D exemplar, and future 3D/multiplex workflows.
+- Added persistent `sam3/sam3_config.json` with SAM3 mode, model folders,
+  device choice, and layer names.
+- Added SAM3 model-folder validation for SAM3.0 image checkpoints and SAM3.1
+  multiplex checkpoints.
+- Added Accept preview to Dataset flow for `SAM3 preview labels`.
 - Moved advanced U-Net architecture and imported-weight controls out of the
   primary training view.
 - Replaced dense dataset/checkpoint lists with compact tables.

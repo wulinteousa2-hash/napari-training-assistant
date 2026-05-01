@@ -26,6 +26,7 @@ BENCHMARK_HISTORY_CSV = Path("history") / "benchmark_history.csv"
 ARCHITECTURE_CONFIG = Path("architecture") / "architecture_config.json"
 STARTING_WEIGHTS_CONFIG = Path("models") / "starting_weights_config.json"
 MODEL_REGISTRY = Path("models") / "model_registry.json"
+SAM3_CONFIG = Path("sam3") / "sam3_config.json"
 
 
 def utc_now() -> str:
@@ -81,6 +82,25 @@ def default_mask_preparation_config() -> dict[str, Any]:
     }
 
 
+def default_sam3_config() -> dict[str, Any]:
+    return {
+        "default_mode": "2d_box",
+        "sam3_2d_model_dir": "",
+        "sam3_3d_model_dir": "",
+        "device": "auto",
+        "confidence_threshold": 0.5,
+        "compile_model": False,
+        "last_image_layer": "",
+        "points_layer_name": "SAM3 points",
+        "live_points_layer_name": "SAM3 live points",
+        "boxes_layer_name": "SAM3 boxes",
+        "exemplar_layer_name": "SAM3 exemplar boxes",
+        "multiplex_prompt_layer_name": "SAM3 3D prompts",
+        "preview_labels_layer_name": "SAM3 preview labels",
+        "propagated_labels_layer_name": "SAM3 propagated labels",
+    }
+
+
 def default_project_config(project_path: Path) -> dict[str, Any]:
     now = utc_now()
     return {
@@ -103,6 +123,7 @@ def default_project_config(project_path: Path) -> dict[str, Any]:
         "default_starting_weights_config_path": str(STARTING_WEIGHTS_CONFIG),
         "default_model_backend": "basic_unet",
         "default_starting_model_mode": "latest_project_checkpoint",
+        "default_sam3_config_path": str(SAM3_CONFIG),
         "mask_preparation": default_mask_preparation_config(),
         "latest_checkpoint_id": "",
         "latest_checkpoint_path": "",
@@ -141,6 +162,7 @@ class TrainingProject:
         Path("logs"),
         Path("architecture"),
         Path("models") / "imported",
+        Path("sam3"),
     )
 
     def __init__(self, root: Path):
@@ -165,6 +187,7 @@ class TrainingProject:
         project.ensure_architecture_config()
         project.ensure_starting_weights_config()
         project.ensure_model_registry()
+        project.ensure_sam3_config()
         return project
 
     @property
@@ -198,6 +221,10 @@ class TrainingProject:
     @property
     def model_registry_path(self) -> Path:
         return self.root / MODEL_REGISTRY
+
+    @property
+    def sam3_config_path(self) -> Path:
+        return self.root / SAM3_CONFIG
 
     @property
     def latest_checkpoint_path(self) -> Path:
@@ -261,6 +288,10 @@ class TrainingProject:
                 {"version": 1, "created_at": utc_now(), "updated_at": utc_now(), "models": []},
             )
 
+    def ensure_sam3_config(self) -> None:
+        if not self.sam3_config_path.exists():
+            self.write_json(self.sam3_config_path, default_sam3_config())
+
     def validate(self) -> ProjectState:
         if not self.root.exists():
             return ProjectState("missing", [str(self.root)])
@@ -273,6 +304,7 @@ class TrainingProject:
             ARCHITECTURE_CONFIG,
             STARTING_WEIGHTS_CONFIG,
             MODEL_REGISTRY,
+            SAM3_CONFIG,
         ):
             if not (self.root / relative).exists():
                 missing.append(str(relative))
@@ -287,6 +319,7 @@ class TrainingProject:
         config["latest_dataset_manifest_path"] = str(DATASET_MANIFEST)
         config["default_architecture_config_path"] = str(ARCHITECTURE_CONFIG)
         config["default_starting_weights_config_path"] = str(STARTING_WEIGHTS_CONFIG)
+        config["default_sam3_config_path"] = str(SAM3_CONFIG)
         self.write_json(self.config_path, config)
 
     def update_settings(self, **settings: Any) -> dict[str, Any]:
@@ -327,6 +360,15 @@ class TrainingProject:
     def load_model_registry(self) -> dict[str, Any]:
         self.ensure_model_registry()
         return self.read_json(self.model_registry_path)
+
+    def load_sam3_config(self) -> dict[str, Any]:
+        self.ensure_sam3_config()
+        return {**default_sam3_config(), **self.read_json(self.sam3_config_path)}
+
+    def save_sam3_config(self, sam3_config: dict[str, Any]) -> dict[str, Any]:
+        sam3_config = {**default_sam3_config(), **sam3_config}
+        self.write_json(self.sam3_config_path, sam3_config)
+        return sam3_config
 
     def import_pretrained_model(
         self,
