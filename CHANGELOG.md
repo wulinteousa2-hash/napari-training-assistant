@@ -1,6 +1,30 @@
 # Changelog
 
-## 0.1.0 - Unreleased
+## 0.2.0 - 2026-05-02
+
+- Added SAM3 preview inference for 2D box, 2D points, live points, 2D
+  exemplar, and SAM3.1 3D/multiplex workflows.
+- Added a SAM3 backend package that delegates SAM3.1 multiplex behavior to
+  `napari-sam3-assistant` instead of reimplementing video propagation.
+- Added CUDA-only SAM3.1 multiplex validation with SAM3.0 2D inference kept on
+  the separate image path.
+- Added a persistent SAM3.1 worker thread so the multiplex video predictor can
+  stay loaded in one execution thread across propagation runs.
+- Added queued SAM3.1 frame writing through a Qt timer to avoid napari/Qt label
+  updates throttling SAM3.1 propagation.
+- Added SAM3.1 propagation direction control for `both`, `forward`, and
+  `backward`.
+- Added optional SAM3.1 diagnostics for CUDA/runtime/session state and
+  per-frame propagation timing.
+- Added optional SAM3.1 no-write benchmark mode for isolating propagation speed
+  from napari layer writes.
+- Added progress and activity logging for SAM3 model loading, prompt insertion,
+  propagation, and frame writes.
+- Added SAM3.1 propagated-label output handling for 3D/multiplex results.
+- Added tests covering SAM3 backend routing, prompt conversion, SAM3.1 adapter
+  caching, predictor configuration, and video-session behavior.
+
+## 0.1.0 - 2026-05-02
 
 - Added persistent Training Project Folder support.
 - Added project state tracking for valid, missing, and incomplete projects.

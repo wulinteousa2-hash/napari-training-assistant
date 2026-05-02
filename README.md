@@ -9,9 +9,10 @@ prediction outputs, and logs.
 
 ## Current Scope
 
-This plugin currently implements the persistent project workspace, U-Net
-architecture configuration, checkpoint metadata, imported starting-weight
-tracking, prediction output storage, and dataset mask preparation.
+This plugin currently implements the persistent project workspace, SAM3 preview
+annotation flow, U-Net architecture configuration, checkpoint metadata, imported
+starting-weight tracking, prediction output storage, and dataset mask
+preparation.
 
 The actual PyTorch training runner is not wired in yet. The current `Train
 U-Net` action registers a placeholder checkpoint so the persistence and UI flow
@@ -107,11 +108,11 @@ Supported prompt modes in the compact UI:
 
 - **2D box**: creates/selects `SAM3 boxes` as a Shapes layer in rectangle mode.
 - **2D points**: creates/selects `SAM3 points` as a Points layer.
-- **Live points**: creates/selects `SAM3 live points`; intended for immediate
-  point-driven preview once inference is wired.
+- **Live points**: creates/selects `SAM3 live points` for immediate
+  point-driven preview.
 - **2D exemplar**: creates/selects `SAM3 exemplar boxes` as a Shapes layer.
-- **3D / multiplex**: creates/selects `SAM3 3D prompts`; intended for SAM3.1
-  multiplex propagation once inference is wired.
+- **3D / multiplex**: creates/selects `SAM3 3D prompts` for SAM3.1 multiplex
+  propagation.
 
 Model folder expectations:
 
@@ -121,11 +122,13 @@ Model folder expectations:
   `sam3.1_multiplex.pt`.
 - CPU is only treated as valid for 2D mode. SAM3.1 multiplex requires CUDA.
 
-The current SAM3 tab prepares layers and validates model folders, but real SAM3
-preview inference is not connected yet. Once inference is connected, preview
-results should update `SAM3 preview labels`. The **Accept preview to Dataset**
-button already routes that preview through the same persistent mask-preparation
-path as the Dataset tab.
+The SAM3 tab prepares layers, validates model folders, runs SAM3 previews, and
+writes results to `SAM3 preview labels` for 2D modes or `SAM3 propagated labels`
+for SAM3.1 multiplex propagation. SAM3.1 multiplex uses CUDA and delegates the
+video propagation flow to `napari-sam3-assistant`; frame results are queued and
+written back to napari labels through a Qt timer so layer refreshes do not
+throttle propagation. The **Accept preview to Dataset** button routes the
+preview through the same persistent mask-preparation path as the Dataset tab.
 
 ## U-Net Architecture
 

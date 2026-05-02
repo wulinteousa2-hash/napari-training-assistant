@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from collections import deque
+import time
+import threading
+from os import path
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QSettings, QThread, QTimer, Signal
+from qtpy.QtGui import QKeySequence
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -20,7 +25,9 @@ from qtpy.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QShortcut,
     QSpinBox,
     QDoubleSpinBox,
     QTableWidget,
@@ -30,6 +37,21 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from napari_training_assistant.sam3_backend import (
+    SAM3BackendError,
+    SAM3PreviewEngine,
+)
+from napari_training_assistant.sam3_backend.sam31_persistent_worker import (
+    Sam31Job,
+    Sam31Worker,
+)
+from napari_training_assistant.sam3_backend.device import resolve_device
+
+SETTINGS_ORG = "napari"
+SETTINGS_APP = "napari-training-assistant"
+LAST_PROJECT_PATH_KEY = "last_training_project_path"
+
 
 from napari_training_assistant.project import TrainingProject
 
@@ -83,21 +105,83 @@ SAM3_MODES = (
     ("3D / multiplex", "3d_multiplex"),
 )
 SAM3_DEVICES = (
-    ("Auto", "auto"),
     ("CUDA", "cuda"),
-    ("CPU for 2D", "cpu"),
+)
+SAM3_PROPAGATION_DIRECTIONS = (
+    ("both", "both"),
+    ("forward", "forward"),
+    ("backward", "backward"),
 )
 
 
 class TrainingAssistantWidget(QWidget):
+
+
     """Tabbed workflow dock widget."""
+
+    sam3_activity_message = Signal(str)
+    sam31_job_requested = Signal(object)
 
     def __init__(self, napari_viewer=None):
         super().__init__()
         self.viewer = napari_viewer
         self.project: TrainingProject | None = None
+        self.sam3_engine = SAM3PreviewEngine()
+        self._sam3_worker: Any | None = None
+        self._sam31_thread: QThread | None = None
+        self._sam31_worker: Sam31Worker | None = None
+        self._sam3_worker_failed = False
+        self._sam3_worker_activity = "preview"
+        self._sam3_point_polarity = "positive"
+        self._sam3_live_points_layer = None
+        self._sam3_live_events_suspended = 0
+        self._sam3_layer_writer: Any | None = None
+        self._sam3_frame_queue = deque()
+        self._sam3_frame_write_timer = QTimer(self)
+        self._sam3_frame_write_timer.setInterval(50)
+        self._sam3_frame_write_timer.timeout.connect(self._drain_sam3_frame_queue)
+        self._loading_project_settings = False
         self._build_ui()
+        self.sam3_activity_message.connect(self._log_sam3_activity)
+        self.sam3_engine.reference_backend.logger = self.sam3_activity_message.emit
+        self._build_sam3_shortcuts()
         self._set_project_actions_enabled(False)
+        self._try_auto_open_last_project()
+        
+
+    def _settings(self) -> QSettings:
+        return QSettings(SETTINGS_ORG, SETTINGS_APP)
+
+
+    def _last_project_path(self) -> str:
+        path = self._settings().value(LAST_PROJECT_PATH_KEY, "", type=str)
+        return path or str(Path.home())
+
+
+    def _remember_project_path(self, path: str | Path) -> None:
+        self._settings().setValue(
+            LAST_PROJECT_PATH_KEY,
+            str(Path(path).expanduser().resolve()),
+        )
+
+    
+
+    def _try_auto_open_last_project(self) -> None:
+        path = self._last_project_path()
+        if not path:
+            return
+
+        project_path = Path(path).expanduser()
+        if not project_path.exists():
+            return
+
+        try:
+            self.open_project(project_path)
+        except Exception:
+            # Do not crash napari if the remembered project is invalid.
+            self.project = None
+            self._set_project_actions_enabled(False)
+
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -114,6 +198,17 @@ class TrainingAssistantWidget(QWidget):
         self.tabs.addTab(self._build_advanced_tab(), "Advanced")
         layout.addWidget(self.tabs)
 
+    def _build_sam3_shortcuts(self) -> None:
+        self.sam3_live_debounce_timer = QTimer(self)
+        self.sam3_live_debounce_timer.setSingleShot(True)
+        self.sam3_live_debounce_timer.setInterval(250)
+        self.sam3_live_debounce_timer.timeout.connect(self._run_live_sam3_preview_if_enabled)
+
+        self.sam3_toggle_point_shortcut = QShortcut(QKeySequence("T"), self)
+        self.sam3_toggle_point_shortcut.activated.connect(self.toggle_sam3_next_point_mode)
+        self.sam3_flip_point_shortcut = QShortcut(QKeySequence("Shift+T"), self)
+        self.sam3_flip_point_shortcut.activated.connect(self.flip_sam3_existing_point_polarity)
+
     def _build_sam3_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -126,6 +221,14 @@ class TrainingAssistantWidget(QWidget):
         self.sam3_device_combo = QComboBox()
         self._add_options(self.sam3_device_combo, SAM3_DEVICES)
         self.sam3_device_combo.currentTextChanged.connect(self.persist_sam3_settings)
+        self.sam3_direction_combo = QComboBox()
+        self._add_options(self.sam3_direction_combo, SAM3_PROPAGATION_DIRECTIONS)
+        self.sam3_direction_combo.currentTextChanged.connect(self.persist_sam3_settings)
+        self.sam3_windows_compat_check = QCheckBox("Windows compatibility mode")
+        self.sam3_windows_compat_check.setToolTip(
+            "Optional slower SAM3.1 fallback mode for Windows troubleshooting only."
+        )
+        self.sam3_windows_compat_check.stateChanged.connect(self.persist_sam3_settings)
         self.sam3_2d_model_edit = QLineEdit()
         self.sam3_2d_model_edit.setPlaceholderText("Folder containing sam3.pt or model.safetensors")
         self.sam3_2d_model_edit.editingFinished.connect(self.persist_sam3_settings)
@@ -136,19 +239,26 @@ class TrainingAssistantWidget(QWidget):
         self.sam3_2d_model_button.clicked.connect(lambda: self.browse_sam3_model_dir("2d"))
         self.sam3_3d_model_button = QPushButton("Select 3D")
         self.sam3_3d_model_button.clicked.connect(lambda: self.browse_sam3_model_dir("3d"))
-        self.sam3_status_label = QLabel("SAM3 model not configured.")
-        self.sam3_status_label.setWordWrap(True)
+
+
+
         model_layout.addWidget(QLabel("Mode"), 0, 0)
         model_layout.addWidget(self.sam3_mode_combo, 0, 1)
         model_layout.addWidget(QLabel("Device"), 0, 2)
         model_layout.addWidget(self.sam3_device_combo, 0, 3)
-        model_layout.addWidget(QLabel("2D model"), 1, 0)
-        model_layout.addWidget(self.sam3_2d_model_edit, 1, 1, 1, 2)
-        model_layout.addWidget(self.sam3_2d_model_button, 1, 3)
-        model_layout.addWidget(QLabel("3D model"), 2, 0)
-        model_layout.addWidget(self.sam3_3d_model_edit, 2, 1, 1, 2)
-        model_layout.addWidget(self.sam3_3d_model_button, 2, 3)
-        model_layout.addWidget(self.sam3_status_label, 3, 0, 1, 4)
+        model_layout.addWidget(QLabel("3D direction"), 1, 0)
+        model_layout.addWidget(self.sam3_direction_combo, 1, 1, 1, 3)
+        model_layout.addWidget(self.sam3_windows_compat_check, 2, 0, 1, 4)
+        model_layout.addWidget(QLabel("2D model"), 3, 0)
+        model_layout.addWidget(self.sam3_2d_model_edit, 3, 1, 1, 2)
+        model_layout.addWidget(self.sam3_2d_model_button, 3, 3)
+        model_layout.addWidget(QLabel("3D model"), 4, 0)
+        model_layout.addWidget(self.sam3_3d_model_edit, 4, 1, 1, 2)
+        model_layout.addWidget(self.sam3_3d_model_button, 4, 3)
+        self.sam3_status_label = QLabel("SAM3 model not configured.")
+        self.sam3_status_label.setWordWrap(True)
+        model_layout.addWidget(self.sam3_status_label, 5, 0, 1, 4) 
+
         model_layout.setColumnStretch(1, 1)
         layout.addWidget(model_box)
 
@@ -160,13 +270,19 @@ class TrainingAssistantWidget(QWidget):
         self.sam3_refresh_layers_button.clicked.connect(self.refresh_layer_choices)
         self.sam3_prepare_prompt_button = QPushButton("Prepare prompt layer")
         self.sam3_prepare_prompt_button.clicked.connect(self.prepare_sam3_prompt_layer)
+        self.sam3_positive_point_button = QPushButton("Point +")
+        self.sam3_positive_point_button.clicked.connect(lambda: self.set_sam3_point_polarity("positive"))
+        self.sam3_negative_point_button = QPushButton("Point -")
+        self.sam3_negative_point_button.clicked.connect(lambda: self.set_sam3_point_polarity("negative"))
         self.sam3_prompt_status_label = QLabel("Choose a mode to prepare prompt layers.")
         self.sam3_prompt_status_label.setWordWrap(True)
         prompt_layout.addWidget(QLabel("Image layer"), 0, 0)
         prompt_layout.addWidget(self.sam3_image_layer_combo, 0, 1)
         prompt_layout.addWidget(self.sam3_refresh_layers_button, 0, 2)
         prompt_layout.addWidget(self.sam3_prepare_prompt_button, 1, 0, 1, 3)
-        prompt_layout.addWidget(self.sam3_prompt_status_label, 2, 0, 1, 3)
+        prompt_layout.addWidget(self.sam3_positive_point_button, 2, 0)
+        prompt_layout.addWidget(self.sam3_negative_point_button, 2, 1)
+        prompt_layout.addWidget(self.sam3_prompt_status_label, 3, 0, 1, 3)
         prompt_layout.setColumnStretch(1, 1)
         layout.addWidget(prompt_box)
 
@@ -180,10 +296,32 @@ class TrainingAssistantWidget(QWidget):
         self.sam3_accept_preview_button.clicked.connect(self.accept_sam3_preview_to_dataset)
         self.sam3_preview_layer_label = QLabel("Preview labels: SAM3 preview labels")
         self.sam3_preview_layer_label.setWordWrap(True)
+        self.sam3_progress_bar = QProgressBar()
+        self.sam3_progress_bar.setRange(0, 100)
+        self.sam3_progress_bar.setValue(0)
+        self.sam3_progress_bar.setFormat("Idle")
+        self.sam3_activity_log = QTextEdit()
+        self.sam3_activity_log.setReadOnly(True)
+        self.sam3_activity_log.setFixedHeight(90)
+        self.sam3_activity_log.setPlaceholderText("SAM3 activity log")
+        self.sam3_no_write_benchmark_check = QCheckBox("SAM3.1 no-write benchmark")
+        self.sam3_no_write_benchmark_check.setToolTip(
+            "Diagnostic mode: run SAM3.1 propagation without writing frames to napari."
+        )
+        self.sam3_no_write_benchmark_check.stateChanged.connect(self.persist_sam3_settings)
+        self.sam3_debug_diagnostics_check = QCheckBox("SAM3.1 debug diagnostics")
+        self.sam3_debug_diagnostics_check.setToolTip(
+            "Log SAM3.1 predictor/session internals and per-frame propagation timing."
+        )
+        self.sam3_debug_diagnostics_check.stateChanged.connect(self.persist_sam3_settings)
         preview_layout.addWidget(self.sam3_run_preview_button, 0, 0)
         preview_layout.addWidget(self.sam3_clear_preview_button, 0, 1)
         preview_layout.addWidget(self.sam3_accept_preview_button, 1, 0, 1, 2)
         preview_layout.addWidget(self.sam3_preview_layer_label, 2, 0, 1, 2)
+        preview_layout.addWidget(self.sam3_no_write_benchmark_check, 3, 0, 1, 2)
+        preview_layout.addWidget(self.sam3_debug_diagnostics_check, 4, 0, 1, 2)
+        preview_layout.addWidget(self.sam3_progress_bar, 5, 0, 1, 2)
+        preview_layout.addWidget(self.sam3_activity_log, 6, 0, 1, 2)
         layout.addWidget(preview_box)
         layout.addStretch(1)
         return tab
@@ -463,12 +601,18 @@ class TrainingAssistantWidget(QWidget):
         return box
 
     def select_project_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select / Create Training Project Folder")
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Select / Create Training Project Folder",
+            self._last_project_path(),
+        )
+
         if path:
             self.open_project(path)
 
     def open_project(self, path: str | Path) -> None:
         self.project = TrainingProject.create_or_open(path)
+        self._remember_project_path(path)
         self._set_project_actions_enabled(True)
         self._load_settings_from_project()
         self.refresh_layer_choices()
@@ -545,8 +689,20 @@ class TrainingAssistantWidget(QWidget):
 
     def on_sam3_mode_changed(self, *args: Any) -> None:
         self.persist_sam3_settings()
-        self.prepare_sam3_prompt_layer()
 
+        if self._combo_data(self.sam3_mode_combo) == "3d_multiplex":
+            self.sam3_run_preview_button.setText("Run 3D propagation")
+        else:
+            self.sam3_run_preview_button.setText("Run preview")
+
+        if self._loading_project_settings:
+            return
+        if self._layer_by_name(self.sam3_image_layer_combo.currentText()) is None:
+            self._sync_live_sam3_points_layer(None)
+            self.sam3_prompt_status_label.setText("Select an image layer, then prepare a SAM3 prompt layer.")
+            return
+        self.prepare_sam3_prompt_layer()
+        
     def persist_sam3_settings(self, *args: Any) -> None:
         if self.project is None:
             return
@@ -559,52 +715,429 @@ class TrainingAssistantWidget(QWidget):
         config = self._current_sam3_config()
         mode = config["default_mode"]
         image_layer = self._layer_by_name(self.sam3_image_layer_combo.currentText())
-        ndim = int(getattr(image_layer, "ndim", 2) or 2) if image_layer is not None else 2
+        if image_layer is None:
+            self._sync_live_sam3_points_layer(None)
+            self.sam3_prompt_status_label.setText("Select an image layer before preparing SAM3 prompts.")
+            return
+        ndim = int(getattr(image_layer, "ndim", 2) or 2)
         ndim = max(2, ndim)
         if mode == "2d_points":
             layer = self._ensure_points_layer(config["points_layer_name"], ndim=ndim)
+            self._set_current_sam3_point_polarity(layer)
+            self._sync_live_sam3_points_layer(None)
             self._activate_layer(layer, "add")
             self.sam3_prompt_status_label.setText("Ready: add positive/negative points, then run preview.")
         elif mode == "live_points":
             layer = self._ensure_points_layer(config["live_points_layer_name"], ndim=ndim)
+            self._set_current_sam3_point_polarity(layer)
+            self._sync_live_sam3_points_layer(layer)
             self._activate_layer(layer, "add")
-            self.sam3_prompt_status_label.setText("Ready: live point layer selected. Preview will update once inference is connected.")
+            self.sam3_prompt_status_label.setText("Ready: Live Points armed. T toggles next point; Shift+T flips selected/latest point.")
         elif mode == "2d_box":
+            self._sync_live_sam3_points_layer(None)
             layer = self._ensure_shapes_layer(config["boxes_layer_name"], ndim=ndim)
             self._activate_layer(layer, "add_rectangle")
             self.sam3_prompt_status_label.setText("Ready: draw one or more boxes, then run preview.")
         elif mode == "2d_exemplar":
+            self._sync_live_sam3_points_layer(None)
             layer = self._ensure_shapes_layer(config["exemplar_layer_name"], ndim=ndim)
             self._activate_layer(layer, "add_rectangle")
-            self.sam3_prompt_status_label.setText("Ready: draw exemplar boxes around example objects, then run preview.")
+            self.sam3_prompt_status_label.setText("Ready: draw one or more exemplar boxes, then run preview.")
         else:
-            layer = self._ensure_points_layer(config["multiplex_prompt_layer_name"], ndim=ndim)
-            self._activate_layer(layer, "add")
-            self.sam3_prompt_status_label.setText("Ready: add 3D/multiplex seed prompts. SAM3.1 CUDA inference is wired later.")
+            self._sync_live_sam3_points_layer(None)
+            layer = self._ensure_shapes_layer(config["multiplex_prompt_layer_name"], ndim=ndim)
+            self._activate_layer(layer, "add_rectangle")
+            self.sam3_prompt_status_label.setText("Ready: draw SAM3.1 multiplex box prompts on the source frame.")
         self.persist_sam3_settings()
+
 
     def run_sam3_preview(self) -> None:
         project = self.require_project()
         if project is None:
             return
+
         if self.viewer is None:
             QMessageBox.warning(self, "No viewer", "A napari viewer is required for SAM3 preview.")
             return
+
         image_layer = self._layer_by_name(self.sam3_image_layer_combo.currentText())
         if image_layer is None:
             QMessageBox.warning(self, "Image layer required", "Select an image layer for SAM3 preview.")
             return
+
         config = self._current_sam3_config()
         status_ok, status = self._sam3_model_status(config)
         if not status_ok:
             QMessageBox.warning(self, "SAM3 model folder required", status)
             return
-        preview = self._ensure_preview_labels_layer(image_layer, config["preview_labels_layer_name"])
+
+        mode = config["default_mode"]
+
+        if mode == "3d_multiplex":
+            model_dir = config["sam3_3d_model_dir"]
+            prompt_layer = self._layer_by_name(config["multiplex_prompt_layer_name"])
+        elif mode == "2d_box":
+            model_dir = config["sam3_2d_model_dir"]
+            prompt_layer = self._layer_by_name(config["boxes_layer_name"])
+        elif mode == "2d_exemplar":
+            model_dir = config["sam3_2d_model_dir"]
+            prompt_layer = self._layer_by_name(config["exemplar_layer_name"])
+        elif mode == "live_points":
+            model_dir = config["sam3_2d_model_dir"]
+            prompt_layer = self._layer_by_name(config["live_points_layer_name"])
+        else:
+            model_dir = config["sam3_2d_model_dir"]
+            prompt_layer = self._layer_by_name(config["points_layer_name"])
+
+        if prompt_layer is None:
+            QMessageBox.warning(
+                self,
+                "Prompt layer required",
+                "Click Prepare prompt layer and add a box or point before running SAM3 preview.",
+            )
+            return
+
+        if self._sam3_worker is not None:
+            self._log_sam3_activity("SAM3 is already running. Wait for the current run to finish before starting another.")
+            QMessageBox.information(
+                self,
+                "SAM3 already running",
+                "A SAM3 job is already running. Wait for it to finish before starting another run.",
+            )
+            return
+
+        from napari.qt.threading import thread_worker
+
+        image_data = image_layer.data if mode == "3d_multiplex" else np.asarray(image_layer.data)
+        if mode in {"2d_box", "2d_exemplar", "3d_multiplex"}:
+            prompt_data = list(prompt_layer.data)
+        elif mode in {"2d_points", "live_points"}:
+            prompt_data = {
+                "data": np.asarray(prompt_layer.data),
+                "properties": dict(getattr(prompt_layer, "properties", {}) or {}),
+            }
+        else:
+            prompt_data = np.asarray(prompt_layer.data)
+        image_layer_name = image_layer.name
+        preview_layer_name = (
+            config["propagated_labels_layer_name"]
+            if mode == "3d_multiplex"
+            else config["preview_labels_layer_name"]
+        )
+        threshold = 0.35
+        compile_model = bool(config.get("compile_model", False))
+        device = "cuda"
+        propagation_direction = str(config.get("propagation_direction", "both") or "both")
+        windows_compatibility_mode = bool(config.get("sam31_windows_compatibility_mode", False))
+        no_write_benchmark = bool(config.get("sam31_no_write_benchmark", False))
+        debug_diagnostics = bool(config.get("sam31_debug_diagnostics", False))
+        runtime_mode = str(config.get("sam31_runtime_mode", "performance") or "performance")
+
+        if mode == "3d_multiplex":
+            try:
+                from napari_sam3_assistant.core.models import Sam3Task
+                from napari_sam3_assistant.services.prompt_collector import PromptCollector
+
+                bundle = PromptCollector().collect(
+                    self.viewer,
+                    image_layer_name=image_layer_name,
+                    task=Sam3Task.SEGMENT_3D,
+                    shapes_layer_name=config["multiplex_prompt_layer_name"],
+                    collect_exemplar_rois=False,
+                )
+                adapter = self.sam3_engine._ensure_multiplex_adapter(
+                    model_dir=model_dir,
+                    device="cuda",
+                    threshold=threshold,
+                    compile_model=compile_model,
+                    windows_compatibility_mode=windows_compatibility_mode,
+                )
+                self._log_sam3_activity(
+                    "SAM3.1 image source: "
+                    f"{self.sam3_engine.reference_backend.describe_image_source(image_data)}"
+                )
+                if debug_diagnostics:
+                    self.sam3_engine.reference_backend.log_prompt_diagnostics(bundle)
+            except Exception as exc:
+                QMessageBox.warning(self, "SAM3.1 multiplex setup failed", str(exc))
+                return
+
+
+            self._ensure_sam31_persistent_worker()
+            job = Sam31Job(
+                adapter=adapter,
+                backend=self.sam3_engine.reference_backend,
+                image_data=image_data,
+                bundle=bundle,
+                propagation_direction=propagation_direction,
+                windows_compatibility_mode=windows_compatibility_mode,
+                debug_diagnostics=debug_diagnostics,
+                no_write_benchmark=no_write_benchmark,
+            )
+            self._sam3_frame_queue.clear()
+            self._sam3_worker = self._sam31_worker
+            self._sam3_worker_activity = "3D propagation"
+            self._sam3_worker_failed = False
+            self._set_sam3_running(True)
+            self._log_sam3_activity(
+                "Submitted SAM3.1 multiplex propagation to persistent worker "
+                f"from frame {bundle.image.frame_index or 0} ({propagation_direction}, "
+                f"runtime_mode={runtime_mode}, "
+                f"no_write={no_write_benchmark})."
+            )
+            self.sam31_job_requested.emit(job)
+            return
+
+        @thread_worker
+        def run_preview_worker():
+            yield (5, "Starting SAM3 preview. First model load can take several minutes.")
+            result = self.sam3_engine.run_preview(
+                image=image_data,
+                mode=mode,
+                model_dir=model_dir,
+                device=device,
+                prompt_data=prompt_data,
+                image_layer_name=image_layer_name,
+                dims_current_step=tuple(self.viewer.dims.current_step),
+                threshold=threshold,
+                compile_model=compile_model,
+                propagation_direction=propagation_direction,
+                windows_compatibility_mode=windows_compatibility_mode,
+            )
+            yield ("result", result)
+
+        worker = run_preview_worker()
+        worker.yielded.connect(
+            lambda payload: self._on_sam3_worker_yielded(
+                payload,
+                image_layer_name=image_layer_name,
+                preview_layer_name=preview_layer_name,
+            )
+        )
+        worker.errored.connect(self._on_sam3_worker_error)
+        worker.finished.connect(self._on_sam3_worker_finished)
+        self._sam3_worker = worker
+        self._sam3_worker_activity = "preview"
+        self._sam3_worker_failed = False
+        self._set_sam3_running(True)
+        self._log_sam3_activity(
+            f"Running SAM3 preview: mode={mode}, device={device}, threshold={threshold:.2f}."
+        )
+        worker.start()
+
+    def _on_sam3_worker_yielded(
+        self,
+        payload: Any,
+        *,
+        image_layer_name: str,
+        preview_layer_name: str,
+    ) -> None:
+        if isinstance(payload, tuple) and len(payload) == 2 and payload[0] == "result":
+            self._write_sam3_preview_result(
+                payload[1],
+                image_layer_name=image_layer_name,
+                preview_layer_name=preview_layer_name,
+            )
+            return
+        if isinstance(payload, tuple) and len(payload) == 2 and payload[0] == "frame_result":
+            self._write_sam3_frame_result(
+                payload[1],
+                image_layer_name=image_layer_name,
+                preview_layer_name=preview_layer_name,
+            )
+            return
+        self._on_sam3_progress(payload)
+
+    def _ensure_sam31_persistent_worker(self) -> Sam31Worker:
+        """Create or return the long-lived SAM3.1 multiplex worker.
+
+        The worker lives in one QThread so the expensive SAM3.1 video predictor
+        can be reused across repeated propagation runs.
+        """
+        if self._sam31_worker is not None and self._sam31_thread is not None:
+            return self._sam31_worker
+
+        thread = QThread(self)
+        worker = Sam31Worker()
+        worker.moveToThread(thread)
+
+        self.sam31_job_requested.connect(worker.run_job)
+        worker.result_ready.connect(
+            lambda result: self._queue_sam3_frame_result(
+                result,
+                image_layer_name=str(result.metadata.get("image_layer", "")),
+                preview_layer_name=self._current_sam3_config()["propagated_labels_layer_name"],
+            )
+        )
+        worker.session_ready.connect(self._on_sam3_video_session_returned)
+        worker.log_message.connect(self._log_sam3_activity)
+        worker.failed.connect(lambda message: self._on_sam3_worker_error(RuntimeError(message)))
+        worker.finished.connect(self._on_sam3_worker_finished)
+        thread.finished.connect(worker.deleteLater)
+        thread.start()
+
+        self._sam31_thread = thread
+        self._sam31_worker = worker
+        return worker
+
+    def _shutdown_sam31_persistent_worker(self) -> None:
+        """Stop the persistent SAM3.1 worker. Call only on unload/close."""
+        try:
+            self.sam31_job_requested.disconnect()
+        except Exception:
+            pass
+
+        if self._sam31_thread is not None:
+            self._sam31_thread.quit()
+            self._sam31_thread.wait(3000)
+
+        self._sam31_worker = None
+        self._sam31_thread = None
+
+    def closeEvent(self, event: Any) -> None:
+        self._shutdown_sam31_persistent_worker()
+        super().closeEvent(event)
+
+    def _queue_sam3_frame_result(
+        self,
+        result,
+        *,
+        image_layer_name: str,
+        preview_layer_name: str,
+    ) -> None:
+        """Queue one SAM3.1 video frame for controlled napari layer writing.
+
+        This avoids making the SAM3 propagation worker directly compete with
+        napari layer updates. The worker can continue producing frames while
+        the Qt event loop writes them at a bounded rate.
+        """
+        self._sam3_frame_queue.append((result, image_layer_name, preview_layer_name))
+        if not self._sam3_frame_write_timer.isActive():
+            self._sam3_frame_write_timer.start()
+
+    def _drain_sam3_frame_queue(self) -> None:
+        """Write queued SAM3.1 frame results to napari in small batches."""
+        max_frames_per_tick = 2
+        written = 0
+        while self._sam3_frame_queue and written < max_frames_per_tick:
+            result, image_layer_name, preview_layer_name = self._sam3_frame_queue.popleft()
+            self._write_sam3_frame_result(
+                result,
+                image_layer_name=image_layer_name,
+                preview_layer_name=preview_layer_name,
+            )
+            written += 1
+
+        if not self._sam3_frame_queue:
+            self._sam3_frame_write_timer.stop()
+
+    def _write_sam3_preview_result(
+        self,
+        result,
+        *,
+        image_layer_name: str,
+        preview_layer_name: str,
+    ) -> None:
+        image_layer = self._layer_by_name(image_layer_name)
+        if image_layer is None:
+            self._log_sam3_activity(f"SAM3 preview finished, but image layer is gone: {image_layer_name}")
+            return
+        preview = self._ensure_preview_labels_layer(image_layer, preview_layer_name)
+        preview.data = result.labels
+        preview.metadata["sam3_preview"] = result.metadata
+
         self._activate_layer(preview, "paint")
-        self.sam3_prompt_status_label.setText(
-            "SAM3 preview inference is not wired yet. Prompt and preview layers are ready."
+        if self._combo_data(self.sam3_mode_combo) == "live_points":
+            self._activate_live_sam3_points_layer()
+        self.sam3_prompt_status_label.setText("SAM3 preview updated.")
+        self._on_sam3_progress((100, "SAM3 preview updated."))
+        backend = result.metadata.get("backend_status", "unknown")
+        nonempty_frames = result.metadata.get("nonempty_frames")
+        frame_summary = (
+            f"; nonempty_frames={int(nonempty_frames)}"
+            if nonempty_frames is not None
+            else ""
+        )
+        self._log_sam3_activity(
+            f"SAM3 preview updated: objects={int(np.max(result.labels)) if result.labels.size else 0}{frame_summary}; backend={backend}."
         )
         self.refresh_layer_choices()
+
+    def _write_sam3_frame_result(
+        self,
+        result,
+        *,
+        image_layer_name: str,
+        preview_layer_name: str,
+    ) -> None:
+        write_t0 = time.perf_counter()
+        image_layer = self._layer_by_name(image_layer_name)
+        if image_layer is None:
+            self._log_sam3_activity(f"SAM3.1 frame arrived, but image layer is gone: {image_layer_name}")
+            return
+
+        image_shape = tuple(int(value) for value in getattr(image_layer.data, "shape"))
+        output_shape = self._sam3_video_output_shape(image_layer.name, image_shape)
+
+        try:
+            writer = self._sam3_reference_layer_writer()
+            writer.write_video_frame_result(
+                result,
+                output_shape,
+                labels_name=preview_layer_name,
+            )
+        except Exception as exc:
+            self._log_sam3_activity(f"SAM3.1 frame write failed: {exc}")
+            return
+
+        write_elapsed = time.perf_counter() - write_t0
+        frame_index = result.metadata.get("frame_index", getattr(result, "frame_index", None))
+        stage = result.metadata.get("stage", "")
+
+        if frame_index is not None:
+            try:
+                total_frames = max(int(output_shape[0]), 1)
+                progress = min(99, max(0, int((int(frame_index) + 1) / total_frames * 100)))
+                self.sam3_progress_bar.setRange(0, 100)
+                self.sam3_progress_bar.setValue(progress)
+                self.sam3_progress_bar.setFormat(f"SAM3.1 wrote frame {frame_index}")
+            except Exception:
+                pass
+
+        self._log_sam3_activity(self._sam3_result_summary(result))
+
+        if write_elapsed > 0.2:
+            self._log_sam3_activity(
+                f"SAM3.1 slow frame write: frame={frame_index}, write_time={write_elapsed:.3f} sec"
+            )
+
+        if frame_index is not None and stage == "prompt":
+            self._log_sam3_activity(f"SAM3.1 prompt frame {frame_index} updated.")
+
+    @staticmethod
+    def _sam3_result_summary(result) -> str:
+        frame_index = getattr(result, "frame_index", None)
+        session_id = getattr(result, "session_id", None)
+        if getattr(result, "object_ids", None) is not None:
+            count = len(np.asarray(result.object_ids).reshape(-1))
+        elif getattr(result, "masks", None) is not None:
+            masks = np.asarray(result.masks)
+            count = int(masks.shape[0]) if masks.ndim >= 3 else int(bool(masks.any()))
+        elif getattr(result, "labels", None) is not None:
+            labels = np.asarray(result.labels)
+            count = int(np.max(labels)) if labels.size else 0
+        else:
+            count = 0
+        frame = f" frame={frame_index}" if frame_index is not None else ""
+        session = f" session={session_id}" if session_id else ""
+        return f"SAM3 result:{frame}{session} objects={count}"
+
+    def _sam3_reference_layer_writer(self):
+        if self._sam3_layer_writer is None:
+            from napari_sam3_assistant.services.layer_writer import LayerWriter
+
+            self._sam3_layer_writer = LayerWriter(self.viewer)
+        return self._sam3_layer_writer
 
     def clear_sam3_preview(self) -> None:
         if self.viewer is None:
@@ -615,6 +1148,218 @@ class TrainingAssistantWidget(QWidget):
             if layer is not None:
                 self.viewer.layers.remove(layer)
         self.refresh_layer_choices()
+        self._log_sam3_activity("Cleared SAM3 preview layers.")
+
+    def _on_sam3_progress(self, payload: Any) -> None:
+        if isinstance(payload, tuple) and len(payload) == 2:
+            value, message = payload
+            try:
+                if self.sam3_progress_bar.maximum() != 0:
+                    self.sam3_progress_bar.setValue(int(value))
+            except Exception:
+                pass
+            self.sam3_progress_bar.setFormat(str(message))
+            self.sam3_prompt_status_label.setText(str(message))
+            self._log_sam3_activity(str(message))
+            return
+        self._log_sam3_activity(str(payload))
+
+    def _on_sam3_worker_error(self, error: Any) -> None:
+        self._sam3_worker_failed = True
+        activity = self._sam3_worker_activity
+        message = str(error)
+        self.sam3_prompt_status_label.setText(f"SAM3 {activity} failed.")
+        self._log_sam3_activity(f"SAM3 {activity} failed: {message}")
+        QMessageBox.warning(self, f"SAM3 {activity} failed", message)
+
+    def _on_sam3_model_loaded(self, message: str) -> None:
+        self.sam3_prompt_status_label.setText(str(message))
+        self._on_sam3_progress((100, str(message)))
+
+    def _on_sam3_video_session_returned(self, session: Any) -> None:
+        self.sam3_engine.reference_backend.video_session = session
+        session_id = getattr(session, "session_id", "")
+        if session_id:
+            self._log_sam3_activity(f"Video session ready: {session_id}")
+
+    def _on_sam3_worker_finished(self) -> None:
+        activity = self._sam3_worker_activity
+        self._sam3_worker = None
+
+        # Make sure any queued SAM3.1 frames are written before showing Complete.
+        while self._sam3_frame_queue:
+            self._drain_sam3_frame_queue()
+
+        self._set_sam3_running(False)
+        if self._sam3_worker_failed:
+            self.sam3_progress_bar.setFormat("Failed")
+            self._log_sam3_activity(f"SAM3 {activity} stopped after failure.")
+        else:
+            self.sam3_progress_bar.setRange(0, 100)
+            self.sam3_progress_bar.setValue(100)
+            self.sam3_progress_bar.setFormat("Complete")
+            self._log_sam3_activity(f"SAM3 {activity} finished.")
+
+    def _set_sam3_running(self, running: bool) -> None:
+        activity = self._sam3_worker_activity
+
+        self.sam3_run_preview_button.setEnabled(not running)
+        self.sam3_clear_preview_button.setEnabled(not running)
+        self.sam3_accept_preview_button.setEnabled(not running)
+        self.sam3_progress_bar.setRange(0, 0 if running else 100)
+        self.sam3_progress_bar.setFormat(f"SAM3 {activity} running..." if running else "Idle")
+        if not running and not self._sam3_worker_failed:
+            self.sam3_progress_bar.setValue(0)
+        self.setCursor(Qt.BusyCursor if running else Qt.ArrowCursor)
+
+    def _log_sam3_activity(self, message: str) -> None:
+        self.sam3_activity_log.append(message)
+
+    def _activate_live_sam3_points_layer(self) -> None:
+        layer = self._current_sam3_points_layer()
+        if layer is not None:
+            self._activate_layer(layer, "add")
+
+    def set_sam3_point_polarity(self, polarity: str) -> None:
+        self._sam3_point_polarity = "negative" if polarity == "negative" else "positive"
+        layer = self._current_sam3_points_layer()
+        if layer is not None:
+            selected = sorted(getattr(layer, "selected_data", []))
+            if selected:
+                properties = dict(getattr(layer, "properties", {}) or {})
+                values = self._sam3_point_polarity_values(layer)
+                for index in selected:
+                    values[index] = self._sam3_point_polarity
+                properties["polarity"] = np.asarray(values, dtype=object)
+                layer.properties = properties
+                self._refresh_sam3_point_colors(layer)
+                if self._live_sam3_points_enabled():
+                    self._request_live_sam3_preview()
+            self._set_current_sam3_point_polarity(layer)
+        self._log_sam3_activity(f"Next SAM3 point mode: {self._sam3_point_polarity}.")
+
+    def toggle_sam3_next_point_mode(self) -> None:
+        if not self._point_shortcuts_enabled():
+            return
+        self.set_sam3_point_polarity(
+            "negative" if self._sam3_point_polarity == "positive" else "positive"
+        )
+
+    def flip_sam3_existing_point_polarity(self) -> None:
+        if not self._point_shortcuts_enabled():
+            return
+        layer = self._current_sam3_points_layer()
+        if layer is None:
+            self._log_sam3_activity("No SAM3 points layer selected.")
+            return
+        data = np.asarray(layer.data)
+        if len(data) == 0:
+            self._log_sam3_activity("No SAM3 points available to flip.")
+            return
+        indices = sorted(getattr(layer, "selected_data", [])) or [len(data) - 1]
+        properties = dict(getattr(layer, "properties", {}) or {})
+        values = self._sam3_point_polarity_values(layer)
+        for index in indices:
+            values[index] = "negative" if values[index] == "positive" else "positive"
+        properties["polarity"] = np.asarray(values, dtype=object)
+        layer.properties = properties
+        self._refresh_sam3_point_colors(layer)
+        self._log_sam3_activity(f"Flipped {len(indices)} SAM3 point(s).")
+        if self._live_sam3_points_enabled():
+            self._request_live_sam3_preview()
+
+    def _point_shortcuts_enabled(self) -> bool:
+        return self._combo_data(self.sam3_mode_combo) in {"2d_points", "live_points"}
+
+    def _live_sam3_points_enabled(self) -> bool:
+        return (
+            self.viewer is not None
+            and self._combo_data(self.sam3_mode_combo) == "live_points"
+            and self._sam3_worker is None
+        )
+
+    def _run_live_sam3_preview_if_enabled(self) -> None:
+        if self._live_sam3_points_enabled():
+            self.run_sam3_preview()
+
+    def _request_live_sam3_preview(self) -> None:
+        if self._live_sam3_points_enabled():
+            self.sam3_live_debounce_timer.start()
+
+    def _sync_live_sam3_points_layer(self, layer) -> None:
+        if self._sam3_live_points_layer is layer:
+            return
+        self._disconnect_live_sam3_points_layer()
+        self._sam3_live_points_layer = layer
+        if layer is None:
+            return
+        events = getattr(layer, "events", None)
+        if events is None:
+            return
+        for event_name in ("data", "properties", "set_data"):
+            event = getattr(events, event_name, None)
+            if event is None:
+                continue
+            try:
+                event.connect(self._on_live_sam3_points_changed)
+            except Exception:
+                pass
+
+    def _disconnect_live_sam3_points_layer(self) -> None:
+        layer = self._sam3_live_points_layer
+        if layer is None:
+            return
+        events = getattr(layer, "events", None)
+        if events is not None:
+            for event_name in ("data", "properties", "set_data"):
+                event = getattr(events, event_name, None)
+                if event is None:
+                    continue
+                try:
+                    event.disconnect(self._on_live_sam3_points_changed)
+                except Exception:
+                    pass
+        self._sam3_live_points_layer = None
+
+    def _on_live_sam3_points_changed(self, event: Any = None) -> None:
+        if self._sam3_live_events_suspended:
+            return
+        self._request_live_sam3_preview()
+
+    def _current_sam3_points_layer(self):
+        if self.viewer is None:
+            return None
+        config = self._current_sam3_config()
+        mode = self._combo_data(self.sam3_mode_combo)
+        name = config["live_points_layer_name"] if mode == "live_points" else config["points_layer_name"]
+        return self._layer_by_name(name)
+
+    def _set_current_sam3_point_polarity(self, layer) -> None:
+        if layer is None:
+            return
+        self._sam3_live_events_suspended += 1
+        try:
+            layer.current_properties = {
+                "polarity": np.asarray([self._sam3_point_polarity], dtype=object)
+            }
+        finally:
+            self._sam3_live_events_suspended = max(0, self._sam3_live_events_suspended - 1)
+
+    def _sam3_point_polarity_values(self, layer) -> list[str]:
+        properties = dict(getattr(layer, "properties", {}) or {})
+        values = [str(value) for value in list(properties.get("polarity", []))]
+        if len(values) < len(layer.data):
+            values.extend(["positive"] * (len(layer.data) - len(values)))
+        return [
+            "negative" if str(value).strip().lower() == "negative" else "positive"
+            for value in values[: len(layer.data)]
+        ]
+
+    def _refresh_sam3_point_colors(self, layer) -> None:
+        try:
+            layer.refresh_colors()
+        except Exception:
+            pass
 
     def accept_sam3_preview_to_dataset(self) -> None:
         project = self.require_project()
@@ -625,9 +1370,18 @@ class TrainingAssistantWidget(QWidget):
             return
         config = self._current_sam3_config()
         image_layer = self._layer_by_name(self.sam3_image_layer_combo.currentText())
-        preview_layer = self._layer_by_name(config["preview_labels_layer_name"])
+        preview_layer_name = (
+            config["propagated_labels_layer_name"]
+            if config.get("default_mode") == "3d_multiplex"
+            else config["preview_labels_layer_name"]
+        )
+        preview_layer = self._layer_by_name(preview_layer_name)
         if image_layer is None or preview_layer is None:
-            QMessageBox.warning(self, "Preview required", "Run or create a SAM3 preview labels layer before accepting.")
+            QMessageBox.warning(
+                self,
+                "Preview required",
+                f"Run or create the SAM3 labels layer before accepting: {preview_layer_name}",
+            )
             return
         project.add_pair(
             np.asarray(image_layer.data),
@@ -841,16 +1595,25 @@ class TrainingAssistantWidget(QWidget):
             self.tabs,
             self.sam3_mode_combo,
             self.sam3_device_combo,
+            self.sam3_direction_combo,
+            self.sam3_windows_compat_check,
+            self.sam3_no_write_benchmark_check,
             self.sam3_2d_model_edit,
             self.sam3_3d_model_edit,
             self.sam3_2d_model_button,
             self.sam3_3d_model_button,
+
             self.sam3_image_layer_combo,
             self.sam3_refresh_layers_button,
             self.sam3_prepare_prompt_button,
+            self.sam3_positive_point_button,
+            self.sam3_negative_point_button,
             self.sam3_run_preview_button,
             self.sam3_clear_preview_button,
             self.sam3_accept_preview_button,
+            self.sam3_progress_bar,
+            self.sam3_activity_log,
+            self.sam3_debug_diagnostics_check,
             self.image_layer_combo,
             self.mask_layer_combo,
             self.refresh_layers_button,
@@ -896,49 +1659,66 @@ class TrainingAssistantWidget(QWidget):
     def _load_settings_from_project(self) -> None:
         if self.project is None:
             return
-        config = self.project.load_config()
-        self._restore_combo_data(self.training_mode_combo, config.get("default_training_mode", "Continue from latest checkpoint"))
-        self._restore_combo_data(self.dataset_source_combo, config.get("default_dataset_source", "All accepted masks"))
-        self.patch_size_spin.setValue(int(config.get("patch_size", 256)))
-        self.batch_size_spin.setValue(int(config.get("batch_size", 4)))
-        self.epochs_spin.setValue(int(config.get("epochs", 10)))
-        self.learning_rate_spin.setValue(float(config.get("learning_rate", 0.0001)))
-        self.validation_split_spin.setValue(float(config.get("validation_split", 0.2)))
-        self._restore_combo_text(self.image_normalization_combo, config.get("normalization_mode", "percentile"))
-        self.notes_edit.setPlainText(config.get("notes", ""))
-        mask_preparation = config.get("mask_preparation", {})
-        self._restore_combo_data(
-            self.mask_preparation_combo,
-            mask_preparation.get("mode", "merge_nonzero_to_foreground"),
-        )
-        self.target_class_name_edit.setPlainText(mask_preparation.get("target_class_name", "foreground"))
-        architecture = self.project.load_architecture_config()
-        self._restore_combo_data(self.backend_combo, architecture.get("backend", "basic_unet"))
-        self._restore_combo_data(self.spatial_dims_combo, architecture.get("spatial_dims", "2d"))
-        self._restore_combo_data(self.preset_combo, architecture.get("preset", "standard_unet"))
-        self.depth_spin.setValue(int(architecture.get("depth", 4)))
-        self.base_channels_spin.setValue(int(architecture.get("base_channels", 32)))
-        self._restore_combo_data(self.arch_normalization_combo, architecture.get("normalization", "batch"))
-        self._restore_combo_data(self.upsampling_combo, architecture.get("upsampling", "transpose"))
-        self.input_channels_spin.setValue(int(architecture.get("input_channels", 1)))
-        self._restore_combo_data(self.output_mode_combo, architecture.get("output_mode", "binary"))
-        self.num_classes_spin.setValue(int(architecture.get("num_classes", 2)))
-        self.class_labels_edit.setPlainText(self._class_labels_to_text(architecture.get("class_labels", {})))
-        self.threshold_spin.setValue(float(architecture.get("threshold", 0.5)))
-        starting_weights = self.project.load_starting_weights_config()
-        self._restore_combo_data(self.starting_weights_combo, starting_weights.get("mode", "latest_project_checkpoint"))
-        imported_text = starting_weights.get("imported_model_id") or "No imported model selected"
-        self.imported_model_label.setText(imported_text)
-        sam3_config = self.project.load_sam3_config()
-        self._restore_combo_data(self.sam3_mode_combo, sam3_config.get("default_mode", "2d_box"))
-        self._restore_combo_data(self.sam3_device_combo, sam3_config.get("device", "auto"))
-        self.sam3_2d_model_edit.setText(sam3_config.get("sam3_2d_model_dir", ""))
-        self.sam3_3d_model_edit.setText(sam3_config.get("sam3_3d_model_dir", ""))
-        self._restore_combo_text(self.sam3_image_layer_combo, sam3_config.get("last_image_layer", ""))
+        self._loading_project_settings = True
+        try:
+            config = self.project.load_config()
+            self._restore_combo_data(self.training_mode_combo, config.get("default_training_mode", "Continue from latest checkpoint"))
+            self._restore_combo_data(self.dataset_source_combo, config.get("default_dataset_source", "All accepted masks"))
+            self.patch_size_spin.setValue(int(config.get("patch_size", 256)))
+            self.batch_size_spin.setValue(int(config.get("batch_size", 4)))
+            self.epochs_spin.setValue(int(config.get("epochs", 10)))
+            self.learning_rate_spin.setValue(float(config.get("learning_rate", 0.0001)))
+            self.validation_split_spin.setValue(float(config.get("validation_split", 0.2)))
+            self._restore_combo_text(self.image_normalization_combo, config.get("normalization_mode", "percentile"))
+            self.notes_edit.setPlainText(config.get("notes", ""))
+            mask_preparation = config.get("mask_preparation", {})
+            self._restore_combo_data(
+                self.mask_preparation_combo,
+                mask_preparation.get("mode", "merge_nonzero_to_foreground"),
+            )
+            self.target_class_name_edit.setPlainText(mask_preparation.get("target_class_name", "foreground"))
+            architecture = self.project.load_architecture_config()
+            self._restore_combo_data(self.backend_combo, architecture.get("backend", "basic_unet"))
+            self._restore_combo_data(self.spatial_dims_combo, architecture.get("spatial_dims", "2d"))
+            self._restore_combo_data(self.preset_combo, architecture.get("preset", "standard_unet"))
+            self.depth_spin.setValue(int(architecture.get("depth", 4)))
+            self.base_channels_spin.setValue(int(architecture.get("base_channels", 32)))
+            self._restore_combo_data(self.arch_normalization_combo, architecture.get("normalization", "batch"))
+            self._restore_combo_data(self.upsampling_combo, architecture.get("upsampling", "transpose"))
+            self.input_channels_spin.setValue(int(architecture.get("input_channels", 1)))
+            self._restore_combo_data(self.output_mode_combo, architecture.get("output_mode", "binary"))
+            self.num_classes_spin.setValue(int(architecture.get("num_classes", 2)))
+            self.class_labels_edit.setPlainText(self._class_labels_to_text(architecture.get("class_labels", {})))
+            self.threshold_spin.setValue(float(architecture.get("threshold", 0.5)))
+            starting_weights = self.project.load_starting_weights_config()
+            self._restore_combo_data(self.starting_weights_combo, starting_weights.get("mode", "latest_project_checkpoint"))
+            imported_text = starting_weights.get("imported_model_id") or "No imported model selected"
+            self.imported_model_label.setText(imported_text)
+            sam3_config = self.project.load_sam3_config()
+            self._restore_combo_data(self.sam3_mode_combo, sam3_config.get("default_mode", "2d_box"))
+            self._restore_combo_data(self.sam3_device_combo, "cuda")
+            self._restore_combo_data(self.sam3_direction_combo, sam3_config.get("propagation_direction", "both"))
+            runtime_mode = str(sam3_config.get("sam31_runtime_mode", "") or "")
+            self.sam3_windows_compat_check.setChecked(
+                runtime_mode == "windows_compatibility"
+                or bool(sam3_config.get("sam31_windows_compatibility_mode", False))
+            )
+            self.sam3_no_write_benchmark_check.setChecked(
+                bool(sam3_config.get("sam31_no_write_benchmark", False))
+            )
+            self.sam3_debug_diagnostics_check.setChecked(
+                bool(sam3_config.get("sam31_debug_diagnostics", False))
+            )
+            self.sam3_2d_model_edit.setText(sam3_config.get("sam3_2d_model_dir", ""))
+            self.sam3_3d_model_edit.setText(sam3_config.get("sam3_3d_model_dir", ""))
+            self._restore_combo_text(self.sam3_image_layer_combo, sam3_config.get("last_image_layer", ""))
+        finally:
+            self._loading_project_settings = False
         self._show_dataset_source_warning(self._combo_data(self.dataset_source_combo))
         self._sync_architecture_controls()
         self._refresh_compatibility_status()
         self._refresh_sam3_status()
+        self.sam3_prompt_status_label.setText("Select an image layer, then prepare a SAM3 prompt layer.")
 
     def _refresh_dataset_table(self) -> None:
         if self.project is None:
@@ -1031,7 +1811,16 @@ class TrainingAssistantWidget(QWidget):
             "default_mode": self._combo_data(self.sam3_mode_combo),
             "sam3_2d_model_dir": self.sam3_2d_model_edit.text().strip(),
             "sam3_3d_model_dir": self.sam3_3d_model_edit.text().strip(),
-            "device": self._combo_data(self.sam3_device_combo),
+            "device": "cuda",
+            "propagation_direction": self._combo_data(self.sam3_direction_combo),
+            "sam31_windows_compatibility_mode": self.sam3_windows_compat_check.isChecked(),
+            "sam31_runtime_mode": (
+                "windows_compatibility"
+                if self.sam3_windows_compat_check.isChecked()
+                else "performance"
+            ),
+            "sam31_no_write_benchmark": self.sam3_no_write_benchmark_check.isChecked(),
+            "sam31_debug_diagnostics": self.sam3_debug_diagnostics_check.isChecked(),
             "last_image_layer": self.sam3_image_layer_combo.currentText(),
         }
 
@@ -1141,11 +1930,17 @@ class TrainingAssistantWidget(QWidget):
         if self.project is None:
             self.sam3_status_label.setText("SAM3 model not configured.")
             return
-        ok, message = self._sam3_model_status(self._current_sam3_config())
+        config = self._current_sam3_config()
+        ok, message = self._sam3_model_status(config)
         prefix = "Ready" if ok else "Needs setup"
         self.sam3_status_label.setText(f"{prefix}: {message}")
+        preview_layer_name = (
+            config["propagated_labels_layer_name"]
+            if config.get("default_mode") == "3d_multiplex"
+            else config["preview_labels_layer_name"]
+        )
         self.sam3_preview_layer_label.setText(
-            f"Preview labels: {self._current_sam3_config()['preview_labels_layer_name']}"
+            f"Preview labels: {preview_layer_name}"
         )
 
     def _sam3_model_status(self, config: dict[str, Any]) -> tuple[bool, str]:
@@ -1205,40 +2000,92 @@ class TrainingAssistantWidget(QWidget):
     def _ensure_points_layer(self, name: str, *, ndim: int):
         layer = self._layer_by_name(name)
         if layer is not None:
+            self._set_current_sam3_point_polarity(layer)
             return layer
         data = np.empty((0, ndim), dtype=float)
-        return self.viewer.add_points(
+        layer = self.viewer.add_points(
             data,
             name=name,
             size=8,
-            face_color="lime",
-            edge_color="black",
+            face_color="polarity",
+            face_color_cycle=["#2fb344", "#e03131"],
+            border_color="black",
             properties={"polarity": np.array([], dtype=object)},
+            property_choices={"polarity": ["positive", "negative"]},
         )
+        self._set_current_sam3_point_polarity(layer)
+        return layer
 
     def _ensure_shapes_layer(self, name: str, *, ndim: int):
         layer = self._layer_by_name(name)
         if layer is not None:
-            return layer
+            if self._is_shapes_layer(layer):
+                return layer
+            try:
+                self.viewer.layers.remove(layer)
+            except Exception:
+                return layer
         return self.viewer.add_shapes(
             data=[],
             name=name,
             ndim=ndim,
+            shape_type="rectangle",
             edge_color="yellow",
             face_color="transparent",
             opacity=0.7,
         )
 
+    @staticmethod
+    def _is_shapes_layer(layer) -> bool:
+        return layer is not None and layer.__class__.__name__.lower() == "shapes"
+
     def _ensure_preview_labels_layer(self, image_layer, name: str):
         layer = self._layer_by_name(name)
-        image = np.asarray(image_layer.data)
-        shape = image.shape[-3:] if image.ndim > 3 else image.shape
-        if image.ndim >= 2:
-            shape = image.shape[-2:] if self._combo_data(self.sam3_mode_combo) != "3d_multiplex" else image.shape
+        shape_attr = getattr(image_layer.data, "shape", None)
+        if shape_attr is None:
+            shape_attr = np.asarray(image_layer.data).shape
+        image_shape = tuple(int(value) for value in shape_attr)
+        mode = self._combo_data(self.sam3_mode_combo)
+        dtype = np.uint16
+        if mode == "3d_multiplex":
+            shape = self._sam3_video_output_shape(image_layer.name, image_shape)
+            dtype = np.uint32
+        else:
+            image_ndim = len(image_shape)
+            shape = image_shape[-3:] if image_ndim > 3 else image_shape
+            if image_ndim >= 2:
+                shape = image_shape[-2:]
         if layer is not None:
+            layer_data = np.asarray(layer.data)
+            if tuple(layer_data.shape) != tuple(shape) or layer_data.dtype != dtype:
+                layer.data = np.zeros(shape, dtype=dtype)
+                try:
+                    layer.refresh()
+                except Exception:
+                    pass
             return layer
-        labels = np.zeros(shape, dtype=np.uint16)
+        labels = np.zeros(shape, dtype=dtype)
         return self.viewer.add_labels(labels, name=name)
+
+    def _sam3_video_output_shape(self, layer_name: str, image_shape: tuple[int, ...]) -> tuple[int, int, int]:
+        try:
+            from napari_sam3_assistant.core.coordinates import (
+                infer_image_selection,
+                selection_video_output_shape,
+            )
+
+            selection = infer_image_selection(
+                layer_name=layer_name,
+                data_shape=image_shape,
+                dims_current_step=tuple(self.viewer.dims.current_step) if self.viewer is not None else None,
+            )
+            return selection_video_output_shape(selection)
+        except Exception:
+            if len(image_shape) >= 4 and image_shape[-1] in (1, 3, 4):
+                return (image_shape[0], image_shape[-3], image_shape[-2])
+            if len(image_shape) >= 3:
+                return (image_shape[0], image_shape[-2], image_shape[-1])
+            return (1, image_shape[-2], image_shape[-1])
 
     def _activate_layer(self, layer, mode: str) -> None:
         if self.viewer is None or layer is None:
