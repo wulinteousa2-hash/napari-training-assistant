@@ -1,5 +1,7 @@
 name: napari-training-assistant
 display_name: Training Assistant
+description: Persistent SAM3-to-U-Net training project workspace for napari.
+visibility: public
 contributions:
   commands:
     - id: napari-training-assistant.make_training_widget
