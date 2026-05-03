@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "napari-training-assistant"
-version = "0.2.0"
+version = "0.3.0"
 description = "Persistent SAM3-to-U-Net training project workspace for napari."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,11 @@ dependencies = [
   "qtpy",
   "numpy",
   "tifffile",
+  "pillow",
+  "zarr",
+  "ome-zarr",
+  "dask[array]",
+  "torch",
 ]
 classifiers = [
   "Framework :: napari",

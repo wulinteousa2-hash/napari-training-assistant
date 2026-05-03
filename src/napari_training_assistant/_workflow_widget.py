@@ -16,6 +16,8 @@ from qtpy.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -24,6 +26,7 @@ from qtpy.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -47,6 +50,7 @@ from napari_training_assistant.sam3_backend.sam31_persistent_worker import (
     Sam31Worker,
 )
 from napari_training_assistant.sam3_backend.device import resolve_device
+from napari_training_assistant.io.loaders import load_image_any
 
 SETTINGS_ORG = "napari"
 SETTINGS_APP = "napari-training-assistant"
@@ -188,6 +192,7 @@ class TrainingAssistantWidget(QWidget):
         layout.setAlignment(Qt.AlignTop)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addWidget(self._build_project_bar())
+        layout.addWidget(self._build_model_task_bar())
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_sam3_tab(), "SAM3")
@@ -350,6 +355,34 @@ class TrainingAssistantWidget(QWidget):
         layout.addWidget(self.latest_benchmark_label, 2, 1, 1, 5)
         return box
 
+    def _build_model_task_bar(self) -> QWidget:
+        box = QGroupBox("Model Task")
+        layout = QGridLayout(box)
+        layout.setColumnStretch(1, 1)
+        self.model_task_title_label = QLabel("Model Task")
+        self.model_task_combo = QComboBox()
+        self.model_task_combo.currentIndexChanged.connect(self.on_model_task_selected)
+        self.new_task_button = QPushButton("New Task")
+        self.new_task_button.clicked.connect(self.new_model_task)
+        self.duplicate_task_button = QPushButton("Duplicate")
+        self.duplicate_task_button.clicked.connect(self.duplicate_model_task)
+        self.rename_task_button = QPushButton("Rename")
+        self.rename_task_button.clicked.connect(self.rename_model_task)
+        self.import_paired_dataset_button = QPushButton("Import paired dataset")
+        self.import_paired_dataset_button.clicked.connect(self.import_paired_dataset)
+        self.model_task_summary_label = QLabel(
+            "Active: none | binary | classes: none | pairs: 0 | latest: none | start: fresh"
+        )
+        self.model_task_summary_label.setWordWrap(True)
+        layout.addWidget(self.model_task_title_label, 0, 0)
+        layout.addWidget(self.model_task_combo, 0, 1)
+        layout.addWidget(self.new_task_button, 0, 2)
+        layout.addWidget(self.duplicate_task_button, 0, 3)
+        layout.addWidget(self.rename_task_button, 0, 4)
+        layout.addWidget(self.import_paired_dataset_button, 0, 5)
+        layout.addWidget(self.model_task_summary_label, 1, 0, 1, 6)
+        return box
+
     def _build_dataset_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -362,12 +395,15 @@ class TrainingAssistantWidget(QWidget):
         self.refresh_layers_button.clicked.connect(self.refresh_layer_choices)
         self.add_mask_button = QPushButton("Add to dataset")
         self.add_mask_button.clicked.connect(self.add_current_mask_pair)
+        self.open_pair_button = QPushButton("Open selected pair")
+        self.open_pair_button.clicked.connect(self.open_selected_dataset_pair)
         controls_layout.addWidget(QLabel("Image layer"), 0, 0)
         controls_layout.addWidget(self.image_layer_combo, 0, 1)
         controls_layout.addWidget(QLabel("Mask layer"), 1, 0)
         controls_layout.addWidget(self.mask_layer_combo, 1, 1)
         controls_layout.addWidget(self.refresh_layers_button, 0, 2)
         controls_layout.addWidget(self.add_mask_button, 1, 2)
+        controls_layout.addWidget(self.open_pair_button, 2, 2)
         controls_layout.setColumnStretch(1, 1)
         layout.addWidget(controls)
 
@@ -392,7 +428,7 @@ class TrainingAssistantWidget(QWidget):
         preparation_layout.addRow("", self.mask_cleanup_note)
         layout.addWidget(preparation)
 
-        self.dataset_table = self._make_table(("Pair", "Image", "Mask", "Class", "Labels", "Used"))
+        self.dataset_table = self._make_table(("Pair", "Source", "Image", "Mask", "Shape", "Labels", "Used"))
         self.dataset_table.setSelectionMode(QAbstractItemView.MultiSelection)
         layout.addWidget(self.dataset_table, 1)
         return tab
@@ -628,6 +664,157 @@ class TrainingAssistantWidget(QWidget):
         )
         return None
 
+    def on_model_task_selected(self) -> None:
+        if self.project is None or self._loading_project_settings:
+            return
+        task_id = self._combo_data(self.model_task_combo)
+        if not task_id:
+            return
+        try:
+            self.project.set_active_task(task_id)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Model task not found", str(exc))
+            return
+        self._apply_active_task_to_controls()
+        self._refresh_after_task_change()
+
+    def new_model_task(self) -> None:
+        project = self.require_project()
+        if project is None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("New Model Task")
+        layout = QFormLayout(dialog)
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("myelin_binary")
+        output_combo = QComboBox()
+        output_combo.addItems(["binary", "multiclass"])
+        labels_edit = QTextEdit()
+        labels_edit.setFixedHeight(90)
+        labels_edit.setPlainText("0: background\n1: foreground")
+        starting_combo = QComboBox()
+        starting_combo.addItems([
+            "fresh_empty_model",
+            "continue_latest_checkpoint",
+            "copy_from_current_task_config",
+        ])
+
+        def on_mode_changed(text: str) -> None:
+            if text == "binary":
+                labels_edit.setPlainText("0: background\n1: foreground")
+            elif labels_edit.toPlainText().strip() == "0: background\n1: foreground":
+                labels_edit.setPlainText("0: background\n1: foreground\n2: class_2")
+
+        output_combo.currentTextChanged.connect(on_mode_changed)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow("Task name", name_edit)
+        layout.addRow("Output mode", output_combo)
+        layout.addRow("Class labels", labels_edit)
+        layout.addRow("Starting mode", starting_combo)
+        layout.addRow("", buttons)
+        result = dialog.exec() if hasattr(dialog, "exec") else dialog.exec_()
+        if result != QDialog.Accepted:
+            return
+        name = name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Task name required", "Enter a model task name.")
+            return
+        output_mode = output_combo.currentText()
+        labels = self._parse_class_labels(
+            labels_edit.toPlainText(),
+            output_mode,
+            2 if output_mode == "binary" else max(2, len(labels_edit.toPlainText().splitlines())),
+        )
+        copy_from = project.active_task_id() if starting_combo.currentText() == "copy_from_current_task_config" else None
+        try:
+            entry = project.create_task(name, output_mode, labels, copy_from_task_id=copy_from)
+            config = project.active_task_config()
+            config["starting_mode"] = starting_combo.currentText()
+            project.save_active_task_config(config)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not create task", str(exc))
+            return
+        project.set_active_task(entry["task_id"])
+        self._refresh_after_task_change()
+
+    def duplicate_model_task(self) -> None:
+        project = self.require_project()
+        if project is None:
+            return
+        source = project.active_task_config()
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Duplicate Model Task",
+            "New task name",
+            text=f"{source.get('display_name', 'Task')} copy",
+        )
+        if not ok or not new_name.strip():
+            return
+        try:
+            entry = project.duplicate_task(project.active_task_id(), new_name.strip())
+            project.set_active_task(entry["task_id"])
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not duplicate task", str(exc))
+            return
+        self._refresh_after_task_change()
+
+    def rename_model_task(self) -> None:
+        project = self.require_project()
+        if project is None:
+            return
+        config = project.active_task_config()
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Rename Model Task",
+            "Task name",
+            text=config.get("display_name", ""),
+        )
+        if not ok or not new_name.strip():
+            return
+        try:
+            project.rename_task(project.active_task_id(), new_name.strip())
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not rename task", str(exc))
+            return
+        self._refresh_after_task_change()
+
+    def import_paired_dataset(self) -> None:
+        project = self.require_project()
+        if project is None:
+            return
+        image_dir = QFileDialog.getExistingDirectory(self, "Select image folder", str(project.root))
+        if not image_dir:
+            return
+        mask_dir = QFileDialog.getExistingDirectory(self, "Select mask folder", str(project.root))
+        if not mask_dir:
+            return
+        image_paths = {path.stem: path for path in sorted(Path(image_dir).iterdir()) if path.is_file()}
+        mask_paths = {path.stem: path for path in sorted(Path(mask_dir).iterdir()) if path.is_file()}
+        matches = [(stem, image_paths[stem], mask_paths[stem]) for stem in sorted(image_paths.keys() & mask_paths.keys())]
+        if not matches:
+            QMessageBox.warning(self, "No matched pairs", "No image/mask files had matching stems.")
+            return
+        unmatched_images = len(set(image_paths) - set(mask_paths))
+        unmatched_masks = len(set(mask_paths) - set(image_paths))
+        message = (
+            f"Import {len(matches)} matched image/mask pairs into the active Model Task?"
+            f"\nUnmatched images: {unmatched_images}. Unmatched masks: {unmatched_masks}."
+        )
+        if QMessageBox.question(self, "Import paired dataset", message) != QMessageBox.Yes:
+            return
+        imported = 0
+        for stem, image_path, mask_path in matches:
+            project.import_existing_pair(
+                image_path,
+                mask_path,
+                metadata={"matched_stem": stem},
+            )
+            imported += 1
+        self._refresh_after_task_change()
+        QMessageBox.information(self, "Import complete", f"Imported {imported} pairs into the active Model Task.")
+
     def refresh_project_summary(self) -> None:
         if self.project is None:
             self._set_project_actions_enabled(False)
@@ -638,17 +825,85 @@ class TrainingAssistantWidget(QWidget):
         latest = project.latest_checkpoint()
         self.project_path_label.setText(self._short_path(project.root))
         self.project_path_label.setToolTip(str(project.root))
-        self.dataset_count_label.setText(str(project.dataset_count()))
+        self.dataset_count_label.setText(str(project.active_task_dataset_count()))
         self.latest_checkpoint_label.setText(
             latest["checkpoint_id"] if latest else config.get("latest_checkpoint_path") or "None"
         )
         self.latest_benchmark_label.setText(project.latest_benchmark_summary() or "None")
         self.project_state_label.setText(state.label)
+        self._refresh_model_task_combo()
+        self._refresh_model_task_summary()
         self._refresh_dataset_table()
         self._refresh_checkpoint_table()
         self._refresh_prediction_table()
         self._refresh_train_summary()
         self._refresh_compatibility_status()
+
+    def _refresh_after_task_change(self) -> None:
+        self._apply_active_task_to_controls()
+        self.refresh_project_summary()
+
+    def _refresh_model_task_combo(self) -> None:
+        if self.project is None:
+            return
+        active = self.project.active_task_id()
+        self.model_task_combo.blockSignals(True)
+        self.model_task_combo.clear()
+        for entry in self.project.task_entries():
+            self.model_task_combo.addItem(entry.get("display_name", entry["task_id"]), entry["task_id"])
+        index = self._find_combo_data(self.model_task_combo, active)
+        self.model_task_combo.setCurrentIndex(index)
+        self.model_task_combo.blockSignals(False)
+
+    def _refresh_model_task_summary(self) -> None:
+        if self.project is None:
+            self.model_task_summary_label.setText(
+                "Active: none | binary | classes: none | pairs: 0 | latest: none | start: fresh"
+            )
+            return
+        config = self.project.active_task_config()
+        labels = ", ".join(
+            f"{key}:{value}" for key, value in sorted(config.get("class_labels", {}).items(), key=lambda item: int(item[0]))
+        )
+        latest = self.project.latest_checkpoint()
+        latest_text = latest.get("checkpoint_id", "none") if latest else "none"
+        start_mode = config.get("starting_mode", "fresh_empty_model")
+        start_text = "continue" if start_mode in {"continue_latest_checkpoint", "continue_latest"} else "fresh"
+        task_root = self.project.active_task_root()
+        checkpoints = task_root / "checkpoints"
+        predictions = task_root / "predictions"
+        self.model_task_summary_label.setText(
+            f"Active: {config.get('display_name', config.get('task_id', 'task'))} | "
+            f"{config.get('output_mode', 'binary')} | classes: {labels or 'none'} | "
+            f"pairs: {self.project.active_task_dataset_count()} | latest: {latest_text} | "
+            f"start: {start_text} | checkpoints: {self._short_path(checkpoints)} | "
+            f"predictions: {self._short_path(predictions)}"
+        )
+
+    def _apply_active_task_to_controls(self) -> None:
+        if self.project is None or not hasattr(self, "output_mode_combo"):
+            return
+        task_config = self.project.active_task_config()
+        architecture = {**self.project.load_architecture_config(), **task_config.get("architecture", {})}
+        output_mode = task_config.get("output_mode", architecture.get("output_mode", "binary"))
+        class_labels = task_config.get("class_labels", architecture.get("class_labels", {}))
+        architecture["output_mode"] = output_mode
+        architecture["class_labels"] = class_labels
+        architecture["num_classes"] = max([int(key) for key in class_labels] or [1]) + 1
+        architecture["output_channels"] = 1 if output_mode == "binary" else architecture["num_classes"]
+        self._loading_project_settings = True
+        try:
+            self._restore_combo_data(self.output_mode_combo, output_mode)
+            self.num_classes_spin.setValue(int(architecture.get("num_classes", 2)))
+            self.class_labels_edit.setPlainText(self._class_labels_to_text(class_labels))
+            starting_mode = task_config.get("starting_mode", "fresh_empty_model")
+            self._restore_combo_data(
+                self.starting_weights_combo,
+                "latest_project_checkpoint" if starting_mode == "continue_latest_checkpoint" else "scratch",
+            )
+        finally:
+            self._loading_project_settings = False
+        self._sync_architecture_controls()
 
     def refresh_layer_choices(self) -> None:
         layer_names = []
@@ -1388,12 +1643,13 @@ class TrainingAssistantWidget(QWidget):
             np.asarray(preview_layer.data),
             image_layer_name=image_layer.name,
             mask_layer_name=preview_layer.name,
+            source="sam3_preview",
             mask_preparation=self._current_mask_preparation(),
             metadata={"source": "sam3_preview", "sam3": config},
         )
         self.image_layer_combo.setCurrentText(image_layer.name)
         self.mask_layer_combo.setCurrentText(preview_layer.name)
-        self.refresh_project_summary()
+        self._refresh_after_task_change()
         self.tabs.setCurrentIndex(1)
 
     def add_current_mask_pair(self) -> None:
@@ -1414,12 +1670,50 @@ class TrainingAssistantWidget(QWidget):
                 np.asarray(mask_layer.data),
                 image_layer_name=image_layer.name,
                 mask_layer_name=mask_layer.name,
+                source="manual_label",
                 mask_preparation=self._current_mask_preparation(),
             )
         except ValueError as exc:
             QMessageBox.warning(self, "Mask labels do not match settings", str(exc))
             return
-        self.refresh_project_summary()
+        self._refresh_after_task_change()
+
+    def open_selected_dataset_pair(self) -> None:
+        project = self.require_project()
+        if project is None:
+            return
+        if self.viewer is None:
+            QMessageBox.warning(self, "No viewer", "A napari viewer is required to open dataset pairs.")
+            return
+        selected = self.dataset_table.selectionModel().selectedRows()
+        if not selected:
+            QMessageBox.warning(self, "Dataset pair required", "Select one dataset pair to open.")
+            return
+        item = self.dataset_table.item(selected[0].row(), 0)
+        pair_id = item.data(Qt.UserRole) if item is not None else ""
+        pair = next((candidate for candidate in project.dataset_pairs() if candidate.get("pair_id") == pair_id), None)
+        if pair is None:
+            QMessageBox.warning(self, "Dataset pair missing", "The selected dataset pair was not found.")
+            return
+        image_path = self._project_path(pair.get("image_path", ""))
+        mask_path = self._project_path(pair.get("mask_path", ""))
+        if image_path is None or mask_path is None or not image_path.exists() or not mask_path.exists():
+            QMessageBox.warning(self, "Dataset file missing", "The selected image or mask file no longer exists.")
+            return
+        try:
+            image = load_image_any(image_path)
+            mask = load_image_any(mask_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not open dataset pair", str(exc))
+            return
+        prefix = self._short_id(pair_id)
+        image_layer = self.viewer.add_image(image, name=f"{prefix} image")
+        labels_layer = self.viewer.add_labels(mask, name=f"{prefix} mask")
+        self.refresh_layer_choices()
+        self.image_layer_combo.setCurrentText(image_layer.name)
+        self.mask_layer_combo.setCurrentText(labels_layer.name)
+        self.sam3_image_layer_combo.setCurrentText(image_layer.name)
+        self.tabs.setCurrentIndex(1)
 
     def persist_all_settings(self, *args: Any) -> None:
         self.persist_training_settings()
@@ -1505,23 +1799,23 @@ class TrainingAssistantWidget(QWidget):
         if project is None:
             return
         self.persist_all_settings()
-        config = project.load_config()
         architecture = project.load_architecture_config()
-        starting_weights = project.load_starting_weights_config()
-        if architecture.get("spatial_dims") != "2d":
-            QMessageBox.warning(
-                self,
-                "3D U-Net not implemented",
-                "3D U-Net is reserved in the project schema but not implemented yet.",
-            )
-            return
         selected_checkpoint = self._selected_checkpoint()
         training_mode_label = self._combo_data(self.training_mode_combo)
         parent_checkpoint_id = ""
         if training_mode_label == "Continue from latest checkpoint":
             latest = project.latest_checkpoint()
             parent_checkpoint_id = latest.get("checkpoint_id", "") if latest else ""
-            training_mode = "continue"
+            if latest and latest.get("architecture"):
+                compatible, message = project.architecture_compatibility(
+                    architecture, latest.get("architecture", {})
+                )
+                if not compatible:
+                    QMessageBox.warning(self, "Checkpoint architecture mismatch", message)
+                    return
+            self.starting_weights_combo.setCurrentIndex(
+                self._find_combo_data(self.starting_weights_combo, "latest_project_checkpoint")
+            )
         elif training_mode_label == "Continue from selected checkpoint":
             if not selected_checkpoint:
                 QMessageBox.warning(self, "Checkpoint required", "Select a checkpoint to continue from.")
@@ -1534,9 +1828,14 @@ class TrainingAssistantWidget(QWidget):
                 QMessageBox.warning(self, "Checkpoint architecture mismatch", message)
                 return
             parent_checkpoint_id = selected_checkpoint.get("checkpoint_id", "")
-            training_mode = "continue"
+            self.starting_weights_combo.setCurrentIndex(
+                self._find_combo_data(self.starting_weights_combo, "selected_project_checkpoint")
+            )
         else:
-            training_mode = "scratch"
+            self.starting_weights_combo.setCurrentIndex(
+                self._find_combo_data(self.starting_weights_combo, "scratch")
+            )
+        self.persist_starting_weights_settings()
         selected_pair_ids = self._selected_pair_ids()
         pairs = project.selected_dataset_pairs(
             self._combo_data(self.dataset_source_combo),
@@ -1548,29 +1847,58 @@ class TrainingAssistantWidget(QWidget):
             self.tabs.setCurrentIndex(0)
             return
         pair_ids = [pair["pair_id"] for pair in pairs]
-        patch_size = max(config.get("patch_size", 256), 1)
-        number_of_patches = len(pair_ids) * max(1, config.get("epochs", 1)) * max(1, 256 // patch_size)
-        checkpoint_payload = (
-            "napari-training-assistant checkpoint placeholder\n"
-            f"training_mode={training_mode}\n"
-            f"parent_checkpoint_id={parent_checkpoint_id}\n"
-            f"dataset_pair_ids={','.join(pair_ids)}\n"
-        ).encode("utf-8")
-        project.register_checkpoint(
-            checkpoint_bytes=checkpoint_payload,
-            parent_checkpoint_id=parent_checkpoint_id,
-            training_mode=training_mode,
-            dataset_pair_ids=pair_ids,
-            number_of_patches=number_of_patches,
-            train_validation_split=config.get("validation_split", 0.2),
-            loss_metrics={},
-            dice_iou_metrics={},
-            benchmark_summary=f"{training_mode_label}; {len(pair_ids)} images",
-            architecture=architecture,
-            starting_weights=starting_weights,
+
+        if getattr(self, "_unet_worker", None) is not None:
+            QMessageBox.information(self, "Training already running", "A U-Net training run is already active.")
+            return
+
+        from napari.qt.threading import thread_worker
+        from napari_training_assistant.unet_backend.project_runner import (
+            run_unet_training_for_project,
         )
-        self.refresh_project_summary()
-        self.tabs.setCurrentIndex(2)
+
+        self.train_button.setEnabled(False)
+        self.retrain_button.setEnabled(False)
+        self.train_summary_label.setText(f"Training U-Net on {len(pair_ids)} dataset pairs...")
+
+        @thread_worker
+        def run_training_worker():
+            return run_unet_training_for_project(
+                project,
+                selected_pair_ids=pair_ids,
+            )
+
+        def on_returned(summary: dict[str, Any]) -> None:
+            self._unet_worker = None
+            self.refresh_project_summary()
+            self.tabs.setCurrentIndex(2)
+            self.train_summary_label.setText(
+                f"Training complete: {summary.get('checkpoint_id', 'checkpoint')} "
+                f"with {summary.get('number_of_patches', 0)} patches."
+            )
+            QMessageBox.information(
+                self,
+                "U-Net training complete",
+                f"Saved {summary.get('checkpoint_id', 'checkpoint')} and updated project history.",
+            )
+
+        def on_error(error: Any) -> None:
+            self._unet_worker = None
+            self.refresh_project_summary()
+            message = str(error)
+            self.train_summary_label.setText(f"Training failed: {message}")
+            QMessageBox.critical(self, "U-Net training failed", message)
+
+        def on_finished() -> None:
+            self._unet_worker = None
+            self.refresh_project_summary()
+
+        worker = run_training_worker()
+        worker.returned.connect(on_returned)
+        worker.errored.connect(on_error)
+        worker.finished.connect(on_finished)
+        self._unet_worker = worker
+        worker.start()
 
     def retrain_from_scratch(self) -> None:
         self.training_mode_combo.setCurrentIndex(self._find_combo_data(self.training_mode_combo, "Retrain from scratch"))
@@ -1588,11 +1916,16 @@ class TrainingAssistantWidget(QWidget):
             QMessageBox.warning(self, "Layer required", "Select a prediction layer to save.")
             return
         project.save_prediction(np.asarray(layer.data))
-        self.refresh_project_summary()
+        self._refresh_after_task_change()
 
     def _set_project_actions_enabled(self, enabled: bool) -> None:
         for widget in (
             self.tabs,
+            self.model_task_combo,
+            self.new_task_button,
+            self.duplicate_task_button,
+            self.rename_task_button,
+            self.import_paired_dataset_button,
             self.sam3_mode_combo,
             self.sam3_device_combo,
             self.sam3_direction_combo,
@@ -1618,6 +1951,7 @@ class TrainingAssistantWidget(QWidget):
             self.mask_layer_combo,
             self.refresh_layers_button,
             self.add_mask_button,
+            self.open_pair_button,
             self.mask_preparation_combo,
             self.target_class_name_edit,
             self.training_mode_combo,
@@ -1661,6 +1995,7 @@ class TrainingAssistantWidget(QWidget):
             return
         self._loading_project_settings = True
         try:
+            self._refresh_model_task_combo()
             config = self.project.load_config()
             self._restore_combo_data(self.training_mode_combo, config.get("default_training_mode", "Continue from latest checkpoint"))
             self._restore_combo_data(self.dataset_source_combo, config.get("default_dataset_source", "All accepted masks"))
@@ -1714,6 +2049,7 @@ class TrainingAssistantWidget(QWidget):
             self._restore_combo_text(self.sam3_image_layer_combo, sam3_config.get("last_image_layer", ""))
         finally:
             self._loading_project_settings = False
+        self._apply_active_task_to_controls()
         self._show_dataset_source_warning(self._combo_data(self.dataset_source_combo))
         self._sync_architecture_controls()
         self._refresh_compatibility_status()
@@ -1728,12 +2064,22 @@ class TrainingAssistantWidget(QWidget):
         for row, pair in enumerate(pairs):
             preparation = pair.get("mask_preparation", {})
             used = ", ".join(pair.get("used_in_checkpoints", [])) or "no"
+            image_text = pair.get("image_layer_name") or Path(pair.get("image_path", "")).name
+            mask_text = pair.get("mask_layer_name") or Path(pair.get("mask_path", "")).name
+            shape = pair.get("shape", [])
+            mask_shape = pair.get("mask_shape", [])
+            shape_text = "x".join(str(value) for value in shape) if shape else ""
+            if mask_shape and mask_shape != shape:
+                shape_text = f"{shape_text} / mask {'x'.join(str(value) for value in mask_shape)}"
+            labels = preparation.get("saved_labels", [])
+            labels_text = self._labels_summary(labels) if labels else "not inspected"
             values = (
                 self._short_id(pair.get("pair_id", "")),
-                pair.get("image_layer_name", ""),
-                pair.get("mask_layer_name", ""),
-                preparation.get("target_class_name", ""),
-                self._labels_summary(preparation.get("saved_labels", [])),
+                pair.get("source", "manual_label"),
+                image_text,
+                mask_text,
+                shape_text,
+                labels_text,
                 used,
             )
             for column, value in enumerate(values):
@@ -1741,6 +2087,10 @@ class TrainingAssistantWidget(QWidget):
                 item.setData(Qt.UserRole, pair.get("pair_id", ""))
                 if column == 0:
                     item.setToolTip(pair.get("pair_id", ""))
+                elif column == 2:
+                    item.setToolTip(pair.get("image_path", ""))
+                elif column == 3:
+                    item.setToolTip(pair.get("mask_path", ""))
                 self.dataset_table.setItem(row, column, item)
         self.dataset_table.resizeColumnsToContents()
 
@@ -1773,7 +2123,7 @@ class TrainingAssistantWidget(QWidget):
     def _refresh_prediction_table(self) -> None:
         if self.project is None:
             return
-        outputs = sorted((self.project.root / "predictions").glob("*.tif"))
+        outputs = self.project.prediction_outputs()
         self.prediction_table.setRowCount(len(outputs))
         for row, path in enumerate(outputs):
             relative = path.relative_to(self.project.root)
@@ -1988,6 +2338,12 @@ class TrainingAssistantWidget(QWidget):
         if item is None:
             return None
         return item.data(Qt.UserRole)
+
+    def _project_path(self, value: str | Path) -> Path | None:
+        if self.project is None or not value:
+            return None
+        candidate = Path(value)
+        return candidate if candidate.is_absolute() else self.project.root / candidate
 
     def _layer_by_name(self, name: str):
         if self.viewer is None or not name:

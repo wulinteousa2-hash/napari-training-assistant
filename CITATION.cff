@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use napari-training-assistant in your work, please cite it using this metadata."
+type: software
+title: "napari-training-assistant"
+version: "0.2.0"
+date-released: "2026-05-03"
+authors:
+  - family-names: "Teo"
+    given-names: "Wulin"
+    orcid: "https://orcid.org/0000-0001-7815-7014"
+repository-code: "https://github.com/wulinteousa2-hash/napari-training-assistant"
+url: "https://github.com/wulinteousa2-hash/napari-training-assistant"
+license: "MIT"
+keywords:
+  - "napari"
+  - "U-Net"
+  - "SAM3"
+  - "training"
+  - "segmentation"
+  - "microscopy"
+  - "image analysis"
+  - "deep learning"
+abstract: "A napari plugin for SAM3-assisted microscopy segmentation training with U-Net workflows and project-based model checkpoints."

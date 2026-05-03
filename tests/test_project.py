@@ -1,8 +1,10 @@
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 from napari_training_assistant.project import TrainingProject
+from napari_training_assistant.io.loaders import load_image_any
 from napari_training_assistant.unet import describe_basic_unet
 
 
@@ -35,6 +37,53 @@ def test_add_pair_persists_manifest_and_reload(tmp_path: Path):
     assert reopened.dataset_pairs()[0]["pair_id"] == pair["pair_id"]
     assert (project.root / pair["image_path"]).exists()
     assert (project.root / pair["mask_path"]).exists()
+    assert pair["source"] == "manual_label"
+
+
+def test_model_tasks_scope_datasets_and_checkpoints(tmp_path: Path):
+    project = TrainingProject.create_or_open(tmp_path / "training_project")
+    assert project.active_task_id() == "default_binary"
+
+    default_pair = project.add_pair(np.zeros((4, 4)), np.ones((4, 4)))
+    myelin = project.create_task(
+        "myelin_axon_multiclass",
+        "multiclass",
+        {"0": "background", "1": "myelin", "2": "axon"},
+    )
+    assert project.active_task_id() == myelin["task_id"]
+    assert project.dataset_count() == 0
+
+    task_pair = project.add_pair(np.zeros((4, 4)), np.ones((4, 4)), source="sam3_preview")
+    checkpoint = project.register_checkpoint(
+        checkpoint_bytes=b"checkpoint",
+        parent_checkpoint_id="",
+        training_mode="scratch",
+        dataset_pair_ids=[task_pair["pair_id"]],
+    )
+    assert project.latest_checkpoint()["checkpoint_id"] == checkpoint["checkpoint_id"]
+    assert project.active_task_dataset_count() == 1
+    assert project.dataset_pairs()[0]["source"] == "sam3_preview"
+    assert "tasks" in checkpoint["checkpoint_path"]
+
+    project.set_active_task("default_binary")
+    assert [pair["pair_id"] for pair in project.dataset_pairs()] == [default_pair["pair_id"]]
+    assert project.latest_checkpoint() is None
+
+
+def test_import_existing_pair_accepts_jpg_image_and_png_mask(tmp_path: Path):
+    project = TrainingProject.create_or_open(tmp_path / "training_project")
+    image_path = tmp_path / "image_001.jpg"
+    mask_path = tmp_path / "image_001.png"
+    Image.fromarray(np.full((8, 9, 3), 128, dtype=np.uint8)).save(image_path)
+    Image.fromarray(np.ones((8, 9), dtype=np.uint8)).save(mask_path)
+
+    pair = project.import_existing_pair(image_path, mask_path)
+
+    assert pair["source"] == "imported_pair"
+    assert pair["shape"] == [8, 9, 3]
+    assert pair["mask_shape"] == [8, 9]
+    assert load_image_any(project.root / pair["image_path"]).shape == (8, 9, 3)
+    assert load_image_any(project.root / pair["mask_path"]).shape == (8, 9)
 
 
 def test_register_checkpoint_appends_history_and_updates_latest(tmp_path: Path):

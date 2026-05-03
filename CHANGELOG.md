@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.0 - 2026-05-03
+
+- Connected the U-Net training workflow to the project runner instead of only
+  registering placeholder checkpoints.
+- Added task-scoped U-Net training runs under
+  `tasks/<task_id>/history/unet_runs/`, including `best_model.pt`,
+  `config.json`, `summary.json`, and `history.csv`.
+- Added real PyTorch training support using patch datasets, DataLoader-based
+  train/validation splitting, Adam optimization, and checkpoint continuation.
+- Added binary BCE + Dice loss and multiclass cross-entropy + Dice loss.
+- Added Dice, IoU, and F1 metrics for binary and multiclass training.
+- Added 2D and 3D U-Net backend model classes, with 2D as the primary supported
+  user-facing workflow.
+- Added patch extraction utilities with boundary-aware 2D/3D patch starts and
+  optional empty-mask filtering.
+- Added conservative 2D/3D augmentation helpers for flips, rotations, and mild
+  intensity jitter.
+- Added image loading support for TIFF, common image formats, and OME-Zarr
+  through shared loader utilities.
+- Added Model Task project storage so each segmentation goal owns its own
+  dataset, checkpoints, predictions, training history, and benchmark history.
+- Added a Model Task bar with task selection, new task creation, duplication,
+  renaming, summary display, and paired-dataset import.
+- Added paired image/mask dataset import into the active Model Task.
+- Added source tracking for dataset pairs, including `sam3_preview`,
+  `manual_label`, and `imported_pair`.
+- Updated project summaries, dataset counts, checkpoint lookup, prediction
+  outputs, and benchmark history to use the active Model Task.
+- Added checkpoint registration from trained model output and updated
+  task-local `latest.pt` after successful training.
+- Added smarter image/mask pairing utilities for two-folder, one-folder, CSV,
+  and auto pairing modes, including common suffix conventions such as `_image`,
+  `_mask`, `_1`, `_2`, `_label`, and `_seg`; these utilities are available for
+  dataset import workflows and future UI expansion.
+- Updated README to describe the working training workflow, Model Tasks,
+  task-scoped storage, and current 2D-first training scope.
+
 ## 0.2.0 - 2026-05-02
 
 - Added SAM3 preview inference for 2D box, 2D points, live points, 2D
@@ -57,8 +94,3 @@
 - Added tests for project creation, reload, mask persistence, checkpoint
   history, latest checkpoint updates, architecture persistence, starting-weight
   persistence, and binary mask preparation.
-
-Known limitation:
-
-- The real PyTorch training loop is not connected yet. The current train action
-  registers a placeholder checkpoint for persistence-flow validation.
