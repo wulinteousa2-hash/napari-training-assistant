@@ -541,17 +541,54 @@ class TrainingAssistantWidget(QWidget):
     def _build_predict_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        box = QGroupBox("Prediction outputs")
-        form = QFormLayout(box)
+
+        run_box = QGroupBox("Run U-Net prediction")
+        run_layout = QFormLayout(run_box)
+        self.predict_image_layer_combo = QComboBox()
+        self.predict_strategy_combo = QComboBox()
+        self._add_options(
+            self.predict_strategy_combo,
+            (("Auto", "auto"), ("Full image", "full"), ("Tiled", "tiled")),
+        )
+        self.run_layer_prediction_button = QPushButton("Run prediction on selected layer")
+        self.run_layer_prediction_button.clicked.connect(self.run_prediction_on_selected_layer)
+        self.run_folder_prediction_button = QPushButton("Run prediction on input folder")
+        self.run_folder_prediction_button.clicked.connect(self.run_prediction_on_input_folder)
+        run_layout.addRow("Image layer", self.predict_image_layer_combo)
+        run_layout.addRow("Strategy", self.predict_strategy_combo)
+        run_layout.addRow("", self.run_layer_prediction_button)
+        run_layout.addRow("", self.run_folder_prediction_button)
+        layout.addWidget(run_box)
+
+        save_box = QGroupBox("Save prediction layers")
+        save_layout = QFormLayout(save_box)
         self.save_predictions_check = QCheckBox("Save predictions to project")
         self.save_predictions_check.setChecked(True)
         self.prediction_layer_combo = QComboBox()
-        self.save_prediction_button = QPushButton("Save selected prediction")
+        self.save_prediction_button = QPushButton("Save selected prediction layer")
         self.save_prediction_button.clicked.connect(self.save_selected_prediction)
-        form.addRow("", self.save_predictions_check)
-        form.addRow("Prediction layer", self.prediction_layer_combo)
-        form.addRow("", self.save_prediction_button)
-        layout.addWidget(box)
+        self.save_all_prediction_layers_button = QPushButton("Save all prediction-like layers")
+        self.save_all_prediction_layers_button.clicked.connect(self.save_all_prediction_layers)
+        save_layout.addRow("", self.save_predictions_check)
+        save_layout.addRow("Prediction layer", self.prediction_layer_combo)
+        save_layout.addRow("", self.save_prediction_button)
+        save_layout.addRow("", self.save_all_prediction_layers_button)
+        layout.addWidget(save_box)
+
+        activity_box = QGroupBox("Prediction activity")
+        activity_layout = QVBoxLayout(activity_box)
+        self.prediction_progress_bar = QProgressBar()
+        self.prediction_progress_bar.setRange(0, 100)
+        self.prediction_progress_bar.setValue(0)
+        self.prediction_progress_bar.setFormat("Idle")
+        self.prediction_activity_log = QTextEdit()
+        self.prediction_activity_log.setReadOnly(True)
+        self.prediction_activity_log.setFixedHeight(130)
+        self.prediction_activity_log.setPlaceholderText("Prediction activity log")
+        activity_layout.addWidget(self.prediction_progress_bar)
+        activity_layout.addWidget(self.prediction_activity_log)
+        layout.addWidget(activity_box)
+
         self.prediction_table = self._make_table(("Output", "Path"))
         layout.addWidget(self.prediction_table, 1)
         return tab
@@ -928,11 +965,13 @@ class TrainingAssistantWidget(QWidget):
         current_image = self.image_layer_combo.currentText()
         current_mask = self.mask_layer_combo.currentText()
         current_prediction = self.prediction_layer_combo.currentText()
+        current_predict_image = self.predict_image_layer_combo.currentText()
         for combo in (
             self.sam3_image_layer_combo,
             self.image_layer_combo,
             self.mask_layer_combo,
             self.prediction_layer_combo,
+            self.predict_image_layer_combo,
         ):
             combo.blockSignals(True)
             combo.clear()
@@ -942,6 +981,7 @@ class TrainingAssistantWidget(QWidget):
         self._restore_combo_text(self.image_layer_combo, current_image)
         self._restore_combo_text(self.mask_layer_combo, current_mask)
         self._restore_combo_text(self.prediction_layer_combo, current_prediction)
+        self._restore_combo_text(self.predict_image_layer_combo, current_predict_image)
         self._refresh_detected_labels()
 
     def browse_sam3_model_dir(self, kind: str) -> None:
@@ -2038,6 +2078,297 @@ class TrainingAssistantWidget(QWidget):
         self.starting_weights_combo.setCurrentIndex(self._find_combo_data(self.starting_weights_combo, "scratch"))
         self.train_unet()
 
+    def _log_prediction_activity(self, message: str) -> None:
+        self.prediction_activity_log.append(str(message))
+
+    def _set_prediction_running(self, running: bool) -> None:
+        for widget in (
+            self.run_layer_prediction_button,
+            self.run_folder_prediction_button,
+            self.save_prediction_button,
+            self.save_all_prediction_layers_button,
+        ):
+            widget.setEnabled(not running)
+        if running:
+            self.prediction_progress_bar.setRange(0, 0)
+            self.prediction_progress_bar.setFormat("Running...")
+            self.setCursor(Qt.BusyCursor)
+        else:
+            self.prediction_progress_bar.setRange(0, 100)
+            self.setCursor(Qt.ArrowCursor)
+
+    def _prediction_run_dir(self) -> Path | None:
+        project = self.require_project()
+        if project is None:
+            return None
+        checkpoint = self._selected_checkpoint() or project.latest_checkpoint()
+        checkpoint_id = checkpoint.get("checkpoint_id", "") if checkpoint else ""
+        runs_root = project.active_task_root() / "history" / "unet_runs"
+        if not runs_root.exists():
+            QMessageBox.warning(self, "No U-Net run", "Train U-Net before running prediction.")
+            return None
+
+        candidates = sorted(
+            [path for path in runs_root.iterdir() if path.is_dir() and (path / "best_model.pt").exists()],
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if checkpoint_id:
+            for run_dir in candidates:
+                summary_path = run_dir / "summary.json"
+                try:
+                    summary = TrainingProject.read_json(summary_path) if summary_path.exists() else {}
+                except Exception:
+                    summary = {}
+                if summary.get("checkpoint_id") == checkpoint_id:
+                    return run_dir
+        if candidates:
+            return candidates[0]
+        QMessageBox.warning(self, "No U-Net run", "No run folder with best_model.pt was found for the active Model Task.")
+        return None
+
+    @staticmethod
+    def _safe_prediction_name(name: str) -> str:
+        cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(name).strip())
+        cleaned = cleaned.strip("_")
+        return cleaned or "prediction"
+
+    def _save_prediction_array(self, array: np.ndarray, *, source_name: str) -> Path | None:
+        project = self.require_project()
+        if project is None or not self.save_predictions_check.isChecked():
+            return None
+        filename = f"{self._safe_prediction_name(source_name)}_pred.tif"
+        return project.save_prediction(np.asarray(array), name=filename)
+
+    def run_prediction_on_selected_layer(self) -> None:
+        project = self.require_project()
+        if project is None:
+            return
+        if self.viewer is None:
+            QMessageBox.warning(self, "No viewer", "A napari viewer is required to run prediction on a layer.")
+            return
+        run_dir = self._prediction_run_dir()
+        if run_dir is None:
+            return
+        layer = self._layer_by_name(self.predict_image_layer_combo.currentText())
+        if layer is None:
+            QMessageBox.warning(self, "Image layer required", "Select an image layer for prediction.")
+            return
+        if getattr(self, "_prediction_worker", None) is not None:
+            QMessageBox.information(self, "Prediction already running", "A prediction job is already active.")
+            return
+
+        from napari.qt.threading import thread_worker
+
+        image = np.asarray(layer.data)
+        image_name = layer.name
+        strategy = self._combo_data(self.predict_strategy_combo) or "auto"
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        self.prediction_activity_log.clear()
+        self._set_prediction_running(True)
+        self._log_prediction_activity(f"Running U-Net prediction on layer: {image_name}")
+        self._log_prediction_activity(f"Run folder: {run_dir}")
+        self._log_prediction_activity(f"Strategy: {strategy} | device: {device}")
+
+        @thread_worker
+        def prediction_worker():
+            yield (5, "Loading U-Net model...")
+            from napari_training_assistant.unet_backend.predictor import (
+                _predict_with_model,
+                load_model_from_run_folder,
+            )
+            model, cfg = load_model_from_run_folder(run_dir, device=device)
+            yield (20, "Model loaded. Running prediction...")
+            pred, used_strategy = _predict_with_model(model, cfg, image, device=device, strategy=strategy)
+            yield (90, f"Prediction complete with {used_strategy} strategy.")
+            yield ("result", pred, used_strategy)
+
+        worker = prediction_worker()
+        worker.yielded.connect(lambda payload: self._on_layer_prediction_yielded(payload, image_name=image_name))
+        worker.errored.connect(self._on_prediction_error)
+        worker.finished.connect(self._on_prediction_finished)
+        self._prediction_worker = worker
+        worker.start()
+
+    def _on_layer_prediction_yielded(self, payload: Any, *, image_name: str) -> None:
+        if isinstance(payload, tuple) and len(payload) == 3 and payload[0] == "result":
+            _, pred, used_strategy = payload
+            name = f"U-Net prediction - {image_name}"
+            if self.viewer is not None:
+                self.viewer.add_labels(np.asarray(pred), name=name)
+            saved = self._save_prediction_array(pred, source_name=image_name)
+            if saved is not None:
+                self._log_prediction_activity(f"Saved prediction: {saved}")
+            self.prediction_progress_bar.setRange(0, 100)
+            self.prediction_progress_bar.setValue(100)
+            self.prediction_progress_bar.setFormat("Complete")
+            self._log_prediction_activity(f"Added prediction layer: {name} ({used_strategy})")
+            self.refresh_layer_choices()
+            self._refresh_after_task_change()
+            return
+        self._on_prediction_progress(payload)
+
+    def run_prediction_on_input_folder(self) -> None:
+        project = self.require_project()
+        if project is None:
+            return
+        run_dir = self._prediction_run_dir()
+        if run_dir is None:
+            return
+        input_dir = QFileDialog.getExistingDirectory(self, "Select input image folder", str(project.root))
+        if not input_dir:
+            return
+        output_dir = QFileDialog.getExistingDirectory(self, "Select output prediction folder", str(project.active_task_predictions_dir()))
+        if not output_dir:
+            output_dir = str(project.active_task_predictions_dir())
+        if getattr(self, "_prediction_worker", None) is not None:
+            QMessageBox.information(self, "Prediction already running", "A prediction job is already active.")
+            return
+
+        from napari.qt.threading import thread_worker
+
+        strategy = self._combo_data(self.predict_strategy_combo) or "auto"
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.prediction_activity_log.clear()
+        self._set_prediction_running(True)
+        self._log_prediction_activity(f"Running folder prediction: {input_dir}")
+        self._log_prediction_activity(f"Output folder: {output_dir}")
+        self._log_prediction_activity(f"Run folder: {run_dir}")
+
+        @thread_worker
+        def folder_prediction_worker():
+            from napari_training_assistant.unet_backend.predictor import predict_folder_from_run_folder
+
+            def progress_cb(index: int, total: int, path: str, status: str) -> None:
+                yield_payloads.append(("progress", index, total, path, status))
+
+            yield_payloads: deque = deque()
+
+            def cb(index: int, total: int, path: str, status: str) -> None:
+                yield_payloads.append(("progress", index, total, path, status))
+
+            result_holder: dict[str, Any] = {}
+            error_holder: dict[str, Exception] = {}
+
+            def predict_target() -> None:
+                try:
+                    report, cfg = predict_folder_from_run_folder(
+                        run_dir,
+                        input_dir,
+                        output_dir,
+                        device=device,
+                        strategy=strategy,
+                        overwrite=True,
+                        progress_cb=cb,
+                    )
+                    result_holder["report"] = report
+                    result_holder["cfg"] = cfg
+                except Exception as exc:
+                    error_holder["error"] = exc
+
+            thread = threading.Thread(target=predict_target, daemon=True)
+            thread.start()
+            while thread.is_alive():
+                while yield_payloads:
+                    yield yield_payloads.popleft()
+                time.sleep(0.1)
+            thread.join()
+            while yield_payloads:
+                yield yield_payloads.popleft()
+            if "error" in error_holder:
+                raise error_holder["error"]
+            yield ("folder_result", result_holder.get("report", []))
+
+        worker = folder_prediction_worker()
+        worker.yielded.connect(self._on_folder_prediction_yielded)
+        worker.errored.connect(self._on_prediction_error)
+        worker.finished.connect(self._on_prediction_finished)
+        self._prediction_worker = worker
+        worker.start()
+
+    def _on_folder_prediction_yielded(self, payload: Any) -> None:
+        if isinstance(payload, tuple) and len(payload) == 5 and payload[0] == "progress":
+            _, index, total, path, status = payload
+            total = max(int(total), 1)
+            index = int(index)
+            percent = int(round(index / total * 100))
+            self.prediction_progress_bar.setRange(0, 100)
+            self.prediction_progress_bar.setValue(percent)
+            self.prediction_progress_bar.setFormat(f"Predicting {index}/{total}")
+            self._log_prediction_activity(f"{index}/{total} | {Path(path).name} | {status}")
+            return
+        if isinstance(payload, tuple) and len(payload) == 2 and payload[0] == "folder_result":
+            _, report = payload
+            ok = sum(1 for item in report if str(item.get("status", "")) == "ok")
+            errors = sum(1 for item in report if str(item.get("status", "")).startswith("error"))
+            self.prediction_progress_bar.setRange(0, 100)
+            self.prediction_progress_bar.setValue(100)
+            self.prediction_progress_bar.setFormat("Complete")
+            self._log_prediction_activity(f"Folder prediction complete: {ok} ok, {errors} errors, {len(report)} total.")
+            self._refresh_after_task_change()
+            return
+        self._on_prediction_progress(payload)
+
+    def _on_prediction_progress(self, payload: Any) -> None:
+        if isinstance(payload, tuple) and len(payload) == 2:
+            value, message = payload
+            try:
+                if self.prediction_progress_bar.maximum() != 0:
+                    self.prediction_progress_bar.setValue(int(value))
+            except Exception:
+                pass
+            self.prediction_progress_bar.setFormat(str(message))
+            self._log_prediction_activity(str(message))
+            return
+        self._log_prediction_activity(str(payload))
+
+    def _on_prediction_error(self, error: Any) -> None:
+        self._prediction_worker = None
+        message = str(error)
+        self.prediction_progress_bar.setRange(0, 100)
+        self.prediction_progress_bar.setFormat("Failed")
+        self._log_prediction_activity(f"Prediction failed: {message}")
+        QMessageBox.critical(self, "U-Net prediction failed", message)
+
+    def _on_prediction_finished(self) -> None:
+        self._prediction_worker = None
+        self._set_prediction_running(False)
+        self.refresh_project_summary()
+
+    def _prediction_like_layers(self) -> list[Any]:
+        if self.viewer is None:
+            return []
+        out = []
+        for layer in self.viewer.layers:
+            name = str(getattr(layer, "name", "")).lower()
+            if "pred" in name or "prediction" in name or "u-net" in name or "unet" in name:
+                out.append(layer)
+        return out
+
+    def save_all_prediction_layers(self) -> None:
+        project = self.require_project()
+        if project is None:
+            return
+        if not self.save_predictions_check.isChecked():
+            return
+        layers = self._prediction_like_layers()
+        if not layers:
+            QMessageBox.warning(
+                self,
+                "No prediction layers",
+                "No prediction-like layers were found. Layer names should contain pred, prediction, U-Net, or unet.",
+            )
+            return
+        saved = 0
+        for layer in layers:
+            self._save_prediction_array(np.asarray(layer.data), source_name=layer.name)
+            saved += 1
+        self._log_prediction_activity(f"Saved {saved} prediction layer(s) to the active Model Task.")
+        self._refresh_after_task_change()
+
     def save_selected_prediction(self) -> None:
         project = self.require_project()
         if project is None:
@@ -2048,7 +2379,9 @@ class TrainingAssistantWidget(QWidget):
         if layer is None:
             QMessageBox.warning(self, "Layer required", "Select a prediction layer to save.")
             return
-        project.save_prediction(np.asarray(layer.data))
+        saved = self._save_prediction_array(np.asarray(layer.data), source_name=layer.name)
+        if saved is not None:
+            self._log_prediction_activity(f"Saved selected prediction: {saved}")
         self._refresh_after_task_change()
 
     def _set_project_actions_enabled(self, enabled: bool) -> None:
@@ -2119,7 +2452,14 @@ class TrainingAssistantWidget(QWidget):
             self.unet_activity_log,
             self.save_predictions_check,
             self.prediction_layer_combo,
+            self.predict_image_layer_combo,
+            self.predict_strategy_combo,
+            self.run_layer_prediction_button,
+            self.run_folder_prediction_button,
             self.save_prediction_button,
+            self.save_all_prediction_layers_button,
+            self.prediction_progress_bar,
+            self.prediction_activity_log,
             self.dataset_table,
             self.prediction_table,
         ):
