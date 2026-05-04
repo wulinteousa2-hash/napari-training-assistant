@@ -82,6 +82,7 @@ def default_mask_preparation_config() -> dict[str, Any]:
         "target_class_name": "foreground",
         "manual_label_map": {},
         "strict_multiclass_validation": True,
+        "auto_expand_multiclass_labels": True,
     }
 
 
@@ -735,8 +736,8 @@ class TrainingProject:
         image_path = task_relative / "dataset" / "images" / f"{pair_id}.tif"
         mask_path = task_relative / "dataset" / "masks" / f"{pair_id}.tif"
         prepared_mask, preparation_metadata = self.prepare_mask(mask, mask_preparation)
-        tifffile.imwrite(self.root / image_path, np.asarray(image))
-        tifffile.imwrite(self.root / mask_path, prepared_mask)
+        self.write_tiff_array(self.root / image_path, np.asarray(image))
+        self.write_tiff_array(self.root / mask_path, prepared_mask, labels=True)
 
         pair = {
             "pair_id": pair_id,
@@ -829,14 +830,16 @@ class TrainingProject:
             transform = "nonzero_to_foreground"
             mask_mode = "binary"
         elif mode == "keep_labels_as_multiclass":
-            prepared = source.astype(np.int64, copy=False)
+            prepared = source.astype(self.label_dtype_for(source_labels), copy=False)
             saved_labels = [int(value) for value in np.unique(prepared)]
             transform = "keep_labels"
             mask_mode = "multiclass"
             architecture = self.active_task_config().get("architecture", self.load_architecture_config())
             expected = set(range(int(architecture.get("num_classes", 2))))
             unexpected = sorted(set(saved_labels) - expected)
-            if unexpected and settings.get("strict_multiclass_validation", True):
+            if unexpected and settings.get("auto_expand_multiclass_labels", True):
+                self._expand_active_task_for_multiclass_labels(saved_labels)
+            elif unexpected and settings.get("strict_multiclass_validation", True):
                 raise ValueError(
                     "Mask contains labels "
                     f"{saved_labels}, but current multiclass configuration expects labels "
@@ -844,7 +847,8 @@ class TrainingProject:
                 )
         else:
             label_map = {int(k): int(v) for k, v in settings.get("manual_label_map", {}).items()}
-            prepared = np.zeros_like(source, dtype=np.int64)
+            target_labels = list(label_map.values()) or [0]
+            prepared = np.zeros_like(source, dtype=self.label_dtype_for(target_labels))
             for source_value, target_value in label_map.items():
                 prepared[source == source_value] = target_value
             saved_labels = [int(value) for value in np.unique(prepared)]
@@ -856,10 +860,52 @@ class TrainingProject:
             "label_transform": transform,
             "source_labels": source_labels,
             "saved_labels": saved_labels,
+            "source_shape": list(source.shape),
+            "saved_shape": list(prepared.shape),
+            "spatial_dims": int(source.ndim),
         }
         if mode == "manual_label_map":
             metadata["manual_label_map"] = settings.get("manual_label_map", {})
         return prepared, metadata
+
+    def _expand_active_task_for_multiclass_labels(self, labels: list[int]) -> None:
+        labels = sorted({int(label) for label in labels})
+        if not labels:
+            return
+        task_config = self.active_task_config()
+        existing = {
+            str(int(key)): str(value)
+            for key, value in task_config.get("class_labels", {}).items()
+        }
+        for label in labels:
+            existing.setdefault(str(label), "background" if label == 0 else f"class_{label}")
+
+        num_classes = max(labels) + 1
+        architecture = {**self.load_architecture_config(), **task_config.get("architecture", {})}
+        architecture["output_mode"] = "multiclass"
+        architecture["num_classes"] = num_classes
+        architecture["output_channels"] = num_classes
+        architecture["class_labels"] = {
+            str(index): existing.get(str(index), "background" if index == 0 else f"class_{index}")
+            for index in range(num_classes)
+        }
+        architecture["activation"] = "softmax"
+        architecture["loss"] = "cross_entropy_dice"
+
+        task_config["output_mode"] = "multiclass"
+        task_config["class_labels"] = architecture["class_labels"]
+        task_config["architecture"] = architecture
+        self.save_active_task_config(task_config)
+
+        registry = self.load_task_registry()
+        for task in registry.get("tasks", []):
+            if task["task_id"] == task_config["task_id"]:
+                task["output_mode"] = "multiclass"
+                task["class_labels"] = architecture["class_labels"]
+                task["updated_at"] = utc_now()
+                break
+        self.save_task_registry(registry)
+        self.save_architecture_config(architecture)
 
     def load_checkpoints(self) -> dict[str, Any]:
         self.ensure_tasks()
@@ -1059,3 +1105,22 @@ class TrainingProject:
             json.dump(data, handle, indent=2)
             handle.write("\n")
         temporary.replace(path)
+
+    @staticmethod
+    def label_dtype_for(labels: Iterable[int]) -> np.dtype:
+        labels = [int(label) for label in labels]
+        max_label = max(labels) if labels else 0
+        if max_label <= np.iinfo(np.uint8).max:
+            return np.dtype(np.uint8)
+        if max_label <= np.iinfo(np.uint16).max:
+            return np.dtype(np.uint16)
+        return np.dtype(np.uint32)
+
+    @staticmethod
+    def write_tiff_array(path: Path, array: np.ndarray, *, labels: bool = False) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = np.asarray(array)
+        kwargs: dict[str, Any] = {}
+        if labels or (data.ndim == 3 and data.shape[-1] not in (3, 4)):
+            kwargs["photometric"] = "minisblack"
+        tifffile.imwrite(path, data, **kwargs)

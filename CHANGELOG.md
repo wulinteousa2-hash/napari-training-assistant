@@ -26,6 +26,12 @@
 - Added paired image/mask dataset import into the active Model Task.
 - Added source tracking for dataset pairs, including `sam3_preview`,
   `manual_label`, and `imported_pair`.
+- Fixed active-task mask preparation so 3D multiclass masks with labels such as
+  `0,1,2,3` can be accepted, preserved, and used to auto-expand multiclass task
+  labels.
+- Updated dataset label summaries to show source-to-saved label transforms.
+- Saved 3D image/mask TIFF stacks as grayscale pages to avoid RGB
+  misinterpretation.
 - Updated project summaries, dataset counts, checkpoint lookup, prediction
   outputs, and benchmark history to use the active Model Task.
 - Added checkpoint registration from trained model output and updated

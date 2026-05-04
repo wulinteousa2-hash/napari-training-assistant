@@ -141,6 +141,35 @@ def test_binary_mask_preparation_merges_all_nonzero_labels(tmp_path: Path):
     assert stored["mask_preparation"]["saved_labels"] == [0, 1]
 
 
+def test_3d_multiclass_mask_expands_active_task_and_persists_labels(tmp_path: Path):
+    project = TrainingProject.create_or_open(tmp_path / "training_project")
+    image = np.zeros((3, 4, 5), dtype=np.uint8)
+    mask = np.zeros((3, 4, 5), dtype=np.uint16)
+    mask[0] = 1
+    mask[1] = 2
+    mask[2] = 3
+    mask[2, 0, 0] = 0
+
+    pair = project.add_pair(
+        image,
+        mask,
+        mask_preparation={"mode": "keep_labels_as_multiclass"},
+    )
+
+    stored = project.dataset_pairs()[0]
+    task_config = project.active_task_config()
+    assert stored["pair_id"] == pair["pair_id"]
+    assert stored["mask_shape"] == [3, 4, 5]
+    assert stored["mask_preparation"]["mask_mode"] == "multiclass"
+    assert stored["mask_preparation"]["label_transform"] == "keep_labels"
+    assert stored["mask_preparation"]["source_labels"] == [0, 1, 2, 3]
+    assert stored["mask_preparation"]["saved_labels"] == [0, 1, 2, 3]
+    assert stored["mask_preparation"]["spatial_dims"] == 3
+    assert task_config["output_mode"] == "multiclass"
+    assert task_config["architecture"]["num_classes"] == 4
+    assert task_config["class_labels"]["3"] == "class_3"
+
+
 def test_architecture_and_starting_weights_reload(tmp_path: Path):
     project = TrainingProject.create_or_open(tmp_path / "training_project")
     project.save_architecture_config(

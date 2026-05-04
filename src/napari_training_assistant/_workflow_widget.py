@@ -2547,7 +2547,7 @@ class TrainingAssistantWidget(QWidget):
             if mask_shape and mask_shape != shape:
                 shape_text = f"{shape_text} / mask {'x'.join(str(value) for value in mask_shape)}"
             labels = preparation.get("saved_labels", [])
-            labels_text = self._labels_summary(labels) if labels else "not inspected"
+            labels_text = self._mask_labels_text(preparation)
             values = (
                 self._short_id(pair.get("pair_id", "")),
                 pair.get("source", "manual_label"),
@@ -2627,6 +2627,7 @@ class TrainingAssistantWidget(QWidget):
             "target_class_name": self.target_class_name_edit.toPlainText().strip() or "foreground",
             "manual_label_map": {},
             "strict_multiclass_validation": True,
+            "auto_expand_multiclass_labels": True,
         }
 
     def _current_sam3_config(self) -> dict[str, Any]:
@@ -2999,6 +3000,17 @@ class TrainingAssistantWidget(QWidget):
         if len(labels) > max_items:
             preview += ", ..."
         return preview
+
+    def _mask_labels_text(self, preparation: dict[str, Any]) -> str:
+        source = preparation.get("source_labels", [])
+        saved = preparation.get("saved_labels", [])
+        if not source and not saved:
+            return "not inspected"
+        source_text = self._labels_summary(source)
+        saved_text = self._labels_summary(saved)
+        if source == saved or not source:
+            return saved_text
+        return f"{source_text} -> {saved_text}"
 
     @staticmethod
     def _short_id(value: str) -> str:
