@@ -506,6 +506,21 @@ class TrainingAssistantWidget(QWidget):
         actions.addWidget(self.train_button)
         actions.addWidget(self.retrain_button)
         layout.addLayout(actions)
+
+        activity_box = QGroupBox("Training activity")
+        activity_layout = QVBoxLayout(activity_box)
+        self.unet_progress_bar = QProgressBar()
+        self.unet_progress_bar.setRange(0, 100)
+        self.unet_progress_bar.setValue(0)
+        self.unet_progress_bar.setFormat("Idle")
+        self.unet_activity_log = QTextEdit()
+        self.unet_activity_log.setReadOnly(True)
+        self.unet_activity_log.setFixedHeight(160)
+        self.unet_activity_log.setPlaceholderText("U-Net training activity log")
+        activity_layout.addWidget(self.unet_progress_bar)
+        activity_layout.addWidget(self.unet_activity_log)
+        layout.addWidget(activity_box)
+
         layout.addStretch(1)
         return tab
 
@@ -1794,6 +1809,90 @@ class TrainingAssistantWidget(QWidget):
         self.tabs.setCurrentIndex(1)
         self.persist_starting_weights_settings()
 
+    def _clear_unet_activity_log(self) -> None:
+        self.unet_activity_log.clear()
+
+    def _log_unet_activity(self, message: str) -> None:
+        self.unet_activity_log.append(str(message))
+
+    @staticmethod
+    def _format_unet_metric(value: Any) -> str:
+        try:
+            return f"{float(value):.4f}"
+        except Exception:
+            return str(value)
+
+    def _set_unet_training_running(self, running: bool) -> None:
+        self.train_button.setEnabled(not running)
+        self.retrain_button.setEnabled(not running)
+        if running:
+            self.unet_progress_bar.setRange(0, 0)
+            self.unet_progress_bar.setFormat("Preparing...")
+            self.setCursor(Qt.BusyCursor)
+        else:
+            self.unet_progress_bar.setRange(0, 100)
+            self.setCursor(Qt.ArrowCursor)
+
+    def _on_unet_training_progress(self, epoch: int, total_epochs: int, row: dict[str, Any]) -> None:
+        total_epochs = max(int(total_epochs), 1)
+        epoch = int(epoch)
+        percent = int(round(epoch / total_epochs * 100))
+        self.unet_progress_bar.setRange(0, 100)
+        self.unet_progress_bar.setValue(max(0, min(100, percent)))
+        self.unet_progress_bar.setFormat(f"Epoch {epoch}/{total_epochs}")
+        fmt = self._format_unet_metric
+        self._log_unet_activity(
+            f"Epoch {epoch}/{total_epochs} | "
+            f"train_loss={fmt(row.get('train_loss'))} | "
+            f"val_loss={fmt(row.get('val_loss'))} | "
+            f"train_dice={fmt(row.get('train_dice'))} | "
+            f"val_dice={fmt(row.get('val_dice'))} | "
+            f"train_iou={fmt(row.get('train_iou'))} | "
+            f"val_iou={fmt(row.get('val_iou'))} | "
+            f"train_f1={fmt(row.get('train_f1'))} | "
+            f"val_f1={fmt(row.get('val_f1'))}"
+        )
+
+    def _on_unet_training_complete(self, summary: dict[str, Any]) -> None:
+        self.refresh_project_summary()
+        self.tabs.setCurrentIndex(3)
+        checkpoint_id = summary.get("checkpoint_id", "checkpoint")
+        patches = summary.get("number_of_patches", 0)
+        self.train_summary_label.setText(
+            f"Training complete: {checkpoint_id} with {patches} patches."
+        )
+        self.unet_progress_bar.setRange(0, 100)
+        self.unet_progress_bar.setValue(100)
+        self.unet_progress_bar.setFormat("Complete")
+        self._log_unet_activity(f"Training complete: {checkpoint_id}")
+        self._log_unet_activity(
+            f"Patches: {patches} | "
+            f"Best epoch: {summary.get('best_epoch', '')} | "
+            f"Best val Dice: {self._format_unet_metric(summary.get('best_val_dice', ''))} | "
+            f"Best val IoU: {self._format_unet_metric(summary.get('best_val_iou', ''))}"
+        )
+        if summary.get("run_dir"):
+            self._log_unet_activity(f"Run folder: {summary.get('run_dir')}")
+        QMessageBox.information(
+            self,
+            "U-Net training complete",
+            f"Saved {checkpoint_id} and updated project history.",
+        )
+
+    def _on_unet_worker_yielded(self, payload: Any) -> None:
+        if not isinstance(payload, tuple):
+            self._log_unet_activity(str(payload))
+            return
+        if len(payload) >= 1 and payload[0] == "progress":
+            _, epoch, total_epochs, row = payload
+            self._on_unet_training_progress(epoch, total_epochs, row)
+            return
+        if len(payload) >= 1 and payload[0] == "result":
+            _, summary = payload
+            self._on_unet_training_complete(summary)
+            return
+        self._log_unet_activity(str(payload))
+
     def train_unet(self) -> None:
         project = self.require_project()
         if project is None:
@@ -1819,7 +1918,7 @@ class TrainingAssistantWidget(QWidget):
         elif training_mode_label == "Continue from selected checkpoint":
             if not selected_checkpoint:
                 QMessageBox.warning(self, "Checkpoint required", "Select a checkpoint to continue from.")
-                self.tabs.setCurrentIndex(2)
+                self.tabs.setCurrentIndex(3)
                 return
             compatible, message = project.architecture_compatibility(
                 architecture, selected_checkpoint.get("architecture", {})
@@ -1837,14 +1936,15 @@ class TrainingAssistantWidget(QWidget):
             )
         self.persist_starting_weights_settings()
         selected_pair_ids = self._selected_pair_ids()
+        dataset_source = self._combo_data(self.dataset_source_combo)
         pairs = project.selected_dataset_pairs(
-            self._combo_data(self.dataset_source_combo),
+            dataset_source,
             selected_pair_ids=selected_pair_ids,
             parent_checkpoint_id=parent_checkpoint_id,
         )
         if not pairs:
             QMessageBox.warning(self, "Dataset required", "No dataset pairs match the selected dataset source.")
-            self.tabs.setCurrentIndex(0)
+            self.tabs.setCurrentIndex(1)
             return
         pair_ids = [pair["pair_id"] for pair in pairs]
 
@@ -1857,44 +1957,77 @@ class TrainingAssistantWidget(QWidget):
             run_unet_training_for_project,
         )
 
-        self.train_button.setEnabled(False)
-        self.retrain_button.setEnabled(False)
+        config = project.load_config()
+        task_config = project.active_task_config()
+        self._clear_unet_activity_log()
+        self._set_unet_training_running(True)
         self.train_summary_label.setText(f"Training U-Net on {len(pair_ids)} dataset pairs...")
+        self._log_unet_activity("Starting U-Net training.")
+        self._log_unet_activity(f"Task: {task_config.get('display_name', project.active_task_id())}")
+        self._log_unet_activity(f"Dataset source: {dataset_source}")
+        self._log_unet_activity(f"Dataset pairs: {len(pair_ids)}")
+        self._log_unet_activity(
+            f"Patch size: {config.get('patch_size', 256)} | "
+            f"batch size: {config.get('batch_size', 4)} | "
+            f"epochs: {config.get('epochs', 10)} | "
+            f"lr: {config.get('learning_rate', 0.0001)} | "
+            f"validation split: {config.get('validation_split', 0.2)}"
+        )
 
         @thread_worker
         def run_training_worker():
-            return run_unet_training_for_project(
-                project,
-                selected_pair_ids=pair_ids,
-            )
+            queue = deque()
+            result_holder: dict[str, Any] = {}
+            error_holder: dict[str, Exception] = {}
 
-        def on_returned(summary: dict[str, Any]) -> None:
-            self._unet_worker = None
-            self.refresh_project_summary()
-            self.tabs.setCurrentIndex(2)
-            self.train_summary_label.setText(
-                f"Training complete: {summary.get('checkpoint_id', 'checkpoint')} "
-                f"with {summary.get('number_of_patches', 0)} patches."
-            )
-            QMessageBox.information(
-                self,
-                "U-Net training complete",
-                f"Saved {summary.get('checkpoint_id', 'checkpoint')} and updated project history.",
-            )
+            def progress_cb(epoch: int, total_epochs: int, row: dict[str, Any]) -> None:
+                queue.append(("progress", epoch, total_epochs, row))
+
+            def train_target() -> None:
+                try:
+                    result_holder["summary"] = run_unet_training_for_project(
+                        project,
+                        selected_pair_ids=pair_ids,
+                        progress_cb=progress_cb,
+                    )
+                except Exception as exc:
+                    error_holder["error"] = exc
+
+            thread = threading.Thread(target=train_target, daemon=True)
+            thread.start()
+
+            while thread.is_alive():
+                while queue:
+                    yield queue.popleft()
+                time.sleep(0.1)
+
+            thread.join()
+
+            while queue:
+                yield queue.popleft()
+
+            if "error" in error_holder:
+                raise error_holder["error"]
+
+            yield ("result", result_holder.get("summary", {}))
 
         def on_error(error: Any) -> None:
             self._unet_worker = None
             self.refresh_project_summary()
             message = str(error)
             self.train_summary_label.setText(f"Training failed: {message}")
+            self.unet_progress_bar.setRange(0, 100)
+            self.unet_progress_bar.setFormat("Failed")
+            self._log_unet_activity(f"Training failed: {message}")
             QMessageBox.critical(self, "U-Net training failed", message)
 
         def on_finished() -> None:
             self._unet_worker = None
+            self._set_unet_training_running(False)
             self.refresh_project_summary()
 
         worker = run_training_worker()
-        worker.returned.connect(on_returned)
+        worker.yielded.connect(self._on_unet_worker_yielded)
         worker.errored.connect(on_error)
         worker.finished.connect(on_finished)
         self._unet_worker = worker
@@ -1982,6 +2115,8 @@ class TrainingAssistantWidget(QWidget):
             self.use_selected_checkpoint_button,
             self.train_button,
             self.retrain_button,
+            self.unet_progress_bar,
+            self.unet_activity_log,
             self.save_predictions_check,
             self.prediction_layer_combo,
             self.save_prediction_button,
