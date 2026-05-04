@@ -37,6 +37,7 @@
 - Updated README to describe the working training workflow, Model Tasks,
   task-scoped storage, and current 2D-first training scope.
 - Add live U-Net training activity log
+- Add U-Net prediction UI for layers and input folders
 
 ## 0.2.0 - 2026-05-02
 
