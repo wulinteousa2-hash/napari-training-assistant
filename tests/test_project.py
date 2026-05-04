@@ -170,6 +170,41 @@ def test_3d_multiclass_mask_expands_active_task_and_persists_labels(tmp_path: Pa
     assert task_config["class_labels"]["3"] == "class_3"
 
 
+def test_sam_instance_mask_merges_into_selected_semantic_class(tmp_path: Path):
+    project = TrainingProject.create_or_open(tmp_path / "training_project")
+    project.create_task(
+        "myelin axon mito",
+        "multiclass",
+        {"0": "background", "1": "mito", "2": "myelin", "3": "axon"},
+    )
+    image = np.zeros((3, 16, 16), dtype=np.uint8)
+    mask = np.arange(3 * 16 * 16, dtype=np.uint16).reshape(3, 16, 16)
+    mask %= 202
+
+    project.add_pair(
+        image,
+        mask,
+        mask_preparation={
+            "mode": "merge_nonzero_to_target_class",
+            "target_class_name": "myelin",
+        },
+    )
+
+    stored = project.dataset_pairs()[0]
+    task_config = project.active_task_config()
+    preparation = stored["mask_preparation"]
+    saved_mask = load_image_any(project.root / stored["mask_path"])
+    assert stored["mask_shape"] == [3, 16, 16]
+    assert preparation["source_label_type"] == "instance"
+    assert preparation["saved_label_type"] == "semantic"
+    assert preparation["target_class_id"] == 2
+    assert preparation["target_class_name"] == "myelin"
+    assert preparation["saved_labels"] == [0, 2]
+    assert set(np.unique(saved_mask).tolist()) == {0, 2}
+    assert task_config["architecture"]["num_classes"] == 4
+    assert task_config["class_labels"] == {"0": "background", "1": "mito", "2": "myelin", "3": "axon"}
+
+
 def test_architecture_and_starting_weights_reload(tmp_path: Path):
     project = TrainingProject.create_or_open(tmp_path / "training_project")
     project.save_architecture_config(

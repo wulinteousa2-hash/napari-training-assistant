@@ -78,11 +78,13 @@ def default_starting_weights_config() -> dict[str, Any]:
 
 def default_mask_preparation_config() -> dict[str, Any]:
     return {
-        "mode": "merge_nonzero_to_foreground",
+        "mode": "merge_nonzero_to_target_class",
         "target_class_name": "foreground",
+        "target_class_id": None,
         "manual_label_map": {},
         "strict_multiclass_validation": True,
         "auto_expand_multiclass_labels": True,
+        "instance_label_threshold": 32,
     }
 
 
@@ -824,11 +826,13 @@ class TrainingProject:
         source = np.asarray(mask)
         source_labels = [int(value) for value in np.unique(source)]
         mode = settings["mode"]
-        if mode == "merge_nonzero_to_foreground":
-            prepared = (source > 0).astype(np.uint8)
+        if mode in {"merge_nonzero_to_foreground", "merge_nonzero_to_target_class"}:
+            target_class_id, target_class_name = self._target_class_from_mask_settings(settings)
+            prepared = np.zeros_like(source, dtype=self.label_dtype_for([0, target_class_id]))
+            prepared[source > 0] = target_class_id
             saved_labels = [int(value) for value in np.unique(prepared)]
-            transform = "nonzero_to_foreground"
-            mask_mode = "binary"
+            transform = "nonzero_to_foreground" if target_class_id == 1 else "nonzero_to_target_class"
+            mask_mode = "binary" if target_class_id == 1 and len(self._active_semantic_class_labels()) <= 2 else "semantic"
         elif mode == "keep_labels_as_multiclass":
             prepared = source.astype(self.label_dtype_for(source_labels), copy=False)
             saved_labels = [int(value) for value in np.unique(prepared)]
@@ -837,6 +841,12 @@ class TrainingProject:
             architecture = self.active_task_config().get("architecture", self.load_architecture_config())
             expected = set(range(int(architecture.get("num_classes", 2))))
             unexpected = sorted(set(saved_labels) - expected)
+            if unexpected and self._looks_like_instance_mask(source_labels, settings):
+                raise ValueError(
+                    "Mask looks like a SAM-style instance mask with many object IDs. "
+                    "Use 'Merge SAM instances into target class' or map labels to semantic classes "
+                    "instead of creating one training class per instance."
+                )
             if unexpected and settings.get("auto_expand_multiclass_labels", True):
                 self._expand_active_task_for_multiclass_labels(saved_labels)
             elif unexpected and settings.get("strict_multiclass_validation", True):
@@ -856,10 +866,13 @@ class TrainingProject:
             mask_mode = "manual"
         metadata = {
             "mask_mode": mask_mode,
-            "target_class_name": settings.get("target_class_name", "foreground"),
+            "target_class_id": target_class_id if mode in {"merge_nonzero_to_foreground", "merge_nonzero_to_target_class"} else settings.get("target_class_id"),
+            "target_class_name": target_class_name if mode in {"merge_nonzero_to_foreground", "merge_nonzero_to_target_class"} else settings.get("target_class_name", "foreground"),
             "label_transform": transform,
             "source_labels": source_labels,
+            "source_label_type": "instance" if self._looks_like_instance_mask(source_labels, settings) else "semantic",
             "saved_labels": saved_labels,
+            "saved_label_type": "semantic" if mask_mode in {"binary", "semantic", "multiclass"} else "manual",
             "source_shape": list(source.shape),
             "saved_shape": list(prepared.shape),
             "spatial_dims": int(source.ndim),
@@ -867,6 +880,47 @@ class TrainingProject:
         if mode == "manual_label_map":
             metadata["manual_label_map"] = settings.get("manual_label_map", {})
         return prepared, metadata
+
+    def _active_semantic_class_labels(self) -> dict[str, str]:
+        task_config = self.active_task_config()
+        return {
+            str(int(key)): str(value)
+            for key, value in task_config.get("class_labels", {}).items()
+        }
+
+    def _target_class_from_mask_settings(self, settings: dict[str, Any]) -> tuple[int, str]:
+        labels = self._active_semantic_class_labels()
+        requested_id = settings.get("target_class_id")
+        if requested_id not in {None, ""}:
+            class_id = int(requested_id)
+            return class_id, labels.get(str(class_id), str(settings.get("target_class_name") or class_id))
+
+        requested_name = str(settings.get("target_class_name") or "foreground").strip()
+        if requested_name.isdigit():
+            class_id = int(requested_name)
+            return class_id, labels.get(str(class_id), requested_name)
+
+        for key, value in labels.items():
+            if value.strip().lower() == requested_name.lower():
+                return int(key), value
+
+        non_background = [(int(key), value) for key, value in labels.items() if int(key) != 0]
+        if requested_name.lower() == "foreground" and non_background:
+            return non_background[0]
+        raise ValueError(
+            f"Target class '{requested_name}' is not defined for the active model task. "
+            "Use one of: "
+            + ", ".join(f"{key}:{value}" for key, value in sorted(labels.items(), key=lambda item: int(item[0])))
+        )
+
+    def _looks_like_instance_mask(self, labels: list[int], settings: dict[str, Any] | None = None) -> bool:
+        settings = settings or {}
+        nonzero = [label for label in labels if label != 0]
+        if not nonzero:
+            return False
+        semantic_classes = max(1, len([key for key in self._active_semantic_class_labels() if int(key) != 0]))
+        threshold = int(settings.get("instance_label_threshold", 32))
+        return len(nonzero) > max(semantic_classes, threshold)
 
     def _expand_active_task_for_multiclass_labels(self, labels: list[int]) -> None:
         labels = sorted({int(label) for label in labels})

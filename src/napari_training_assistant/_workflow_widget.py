@@ -98,8 +98,9 @@ STARTING_WEIGHT_MODES = (
     ("Imported pretrained U-Net", "imported_pretrained_unet"),
 )
 MASK_PREPARATION_MODES = (
-    ("Merge all labels into foreground", "merge_nonzero_to_foreground"),
-    ("Keep labels as multiclass", "keep_labels_as_multiclass"),
+    ("Merge SAM instances into target class", "merge_nonzero_to_target_class"),
+    ("Binary foreground/background", "merge_nonzero_to_foreground"),
+    ("Keep semantic class labels", "keep_labels_as_multiclass"),
 )
 SAM3_MODES = (
     ("2D box", "2d_box"),
@@ -419,7 +420,7 @@ class TrainingAssistantWidget(QWidget):
         self.detected_labels_label = QLabel("Detected labels: none")
         self.detected_labels_label.setWordWrap(True)
         self.mask_cleanup_note = QLabel(
-            "Binary masks save all nonzero instance labels as one foreground class."
+            "SAM masks often store object instances, not semantic classes. The recommended mode merges all nonzero instance IDs into the selected target class."
         )
         self.mask_cleanup_note.setWordWrap(True)
         preparation_layout.addRow("Mode", self.mask_preparation_combo)
@@ -914,9 +915,7 @@ class TrainingAssistantWidget(QWidget):
             )
             return
         config = self.project.active_task_config()
-        labels = ", ".join(
-            f"{key}:{value}" for key, value in sorted(config.get("class_labels", {}).items(), key=lambda item: int(item[0]))
-        )
+        labels = self._class_summary(config.get("class_labels", {}))
         latest = self.project.latest_checkpoint()
         latest_text = latest.get("checkpoint_id", "none") if latest else "none"
         start_mode = config.get("starting_mode", "fresh_empty_model")
@@ -2484,7 +2483,7 @@ class TrainingAssistantWidget(QWidget):
             mask_preparation = config.get("mask_preparation", {})
             self._restore_combo_data(
                 self.mask_preparation_combo,
-                mask_preparation.get("mode", "merge_nonzero_to_foreground"),
+                mask_preparation.get("mode", "merge_nonzero_to_target_class"),
             )
             self.target_class_name_edit.setPlainText(mask_preparation.get("target_class_name", "foreground"))
             architecture = self.project.load_architecture_config()
@@ -2628,6 +2627,7 @@ class TrainingAssistantWidget(QWidget):
             "manual_label_map": {},
             "strict_multiclass_validation": True,
             "auto_expand_multiclass_labels": True,
+            "instance_label_threshold": 32,
         }
 
     def _current_sam3_config(self) -> dict[str, Any]:
@@ -2750,6 +2750,12 @@ class TrainingAssistantWidget(QWidget):
             self.detected_labels_label.setText("Detected labels: none")
             return
         labels = [int(value) for value in np.unique(np.asarray(layer.data))]
+        nonzero = [label for label in labels if label != 0]
+        if len(nonzero) > 32:
+            self.detected_labels_label.setText(
+                f"Detected labels: {len(nonzero)} instance IDs plus background"
+            )
+            return
         self.detected_labels_label.setText(f"Detected labels: {self._labels_summary(labels, max_items=18)}")
 
     def _refresh_sam3_status(self) -> None:
@@ -2993,6 +2999,19 @@ class TrainingAssistantWidget(QWidget):
         return "\n".join(f"{key}: {labels[key]}" for key in sorted(labels, key=lambda item: int(item)))
 
     @staticmethod
+    def _class_summary(labels: dict[str, str], max_items: int = 6) -> str:
+        if not labels:
+            return "none"
+        items = [
+            f"{key}:{labels[key]}"
+            for key in sorted(labels, key=lambda item: int(item))
+        ]
+        if len(items) <= max_items:
+            return ", ".join(items)
+        visible = ", ".join(items[:max_items])
+        return f"{visible}, +{len(items) - max_items} more"
+
+    @staticmethod
     def _labels_summary(labels: list[int], max_items: int = 10) -> str:
         if not labels:
             return "none"
@@ -3006,6 +3025,10 @@ class TrainingAssistantWidget(QWidget):
         saved = preparation.get("saved_labels", [])
         if not source and not saved:
             return "not inspected"
+        if preparation.get("source_label_type") == "instance":
+            instance_count = len([label for label in source if int(label) != 0])
+            target = preparation.get("target_class_name") or "target"
+            return f"{instance_count} instances -> {target} ({self._labels_summary(saved)})"
         source_text = self._labels_summary(source)
         saved_text = self._labels_summary(saved)
         if source == saved or not source:

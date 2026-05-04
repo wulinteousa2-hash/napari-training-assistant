@@ -29,6 +29,11 @@
 - Fixed active-task mask preparation so 3D multiclass masks with labels such as
   `0,1,2,3` can be accepted, preserved, and used to auto-expand multiclass task
   labels.
+- Treated large SAM-style label sets as instance IDs rather than semantic
+  classes, with a dataset preparation mode that merges all nonzero instances
+  into the selected target class.
+- Compact dataset and Model Task summaries so large instance-label masks no
+  longer flood the UI with hundreds of generated class names.
 - Updated dataset label summaries to show source-to-saved label transforms.
 - Saved 3D image/mask TIFF stacks as grayscale pages to avoid RGB
   misinterpretation.
